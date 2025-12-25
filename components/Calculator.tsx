@@ -200,6 +200,11 @@ export const Calculator: React.FC<CalculatorProps> = ({
           <div className="space-y-2">
             <label className="text-[10px] font-black text-slate-300 uppercase tracking-widest pl-1">Код ТН ВЭД</label>
             <input type="text" value={manualCode} onChange={(e) => setManualCode(e.target.value)} className="w-full bg-white border border-slate-100 rounded-2xl py-5 px-6 text-slate-900 font-mono font-bold outline-none"/>
+            {selectedCode && (
+              <div className="text-[9px] font-black text-emerald-600 uppercase pl-1 animate-in fade-in slide-in-from-top-1 duration-300">
+                Код добавлен автоматически
+              </div>
+            )}
           </div>
           <div className="space-y-2">
             <label className="text-[10px] font-black text-slate-300 uppercase tracking-widest pl-1">Таможенная пошлина</label>
@@ -211,10 +216,20 @@ export const Calculator: React.FC<CalculatorProps> = ({
                 </div>
               )}
             </div>
+            {selectedCode && (
+              <div className="text-[9px] font-black text-emerald-600 uppercase pl-1 animate-in fade-in slide-in-from-top-1 duration-300">
+                Пошлина добавлена автоматически
+              </div>
+            )}
           </div>
           <div className="space-y-2">
             <label className="text-[10px] font-black text-slate-300 uppercase tracking-widest pl-1">Ввозной НДС В %</label>
             <input type="text" value={vatRateStr} onChange={handleInputChange(setVatRateStr)} className="w-full bg-white border border-slate-100 rounded-2xl py-5 px-6 text-slate-900 font-bold outline-none"/>
+            {selectedCode && (
+              <div className="text-[9px] font-black text-emerald-600 uppercase pl-1 animate-in fade-in slide-in-from-top-1 duration-300">
+                НДС добавлен автоматически
+              </div>
+            )}
           </div>
           <div className="space-y-2">
             <label className="text-[10px] font-black text-slate-300 uppercase tracking-widest pl-1">Инвойс ({currency})</label>

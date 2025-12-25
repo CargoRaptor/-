@@ -1,22 +1,19 @@
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
 import { TNVED_DB } from './data/tnved_db';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
-/**
- * Глобальный словарь ассоциаций для ТН ВЭД.
- * Помогает найти категорию по частному названию товара.
- */
 const SEARCH_ASSET_MAP: Record<string, string[]> = {
   'ноут': ['ноутбук', 'компьютер', 'лэптоп', 'вычислительная'],
   'комп': ['ноутбук', 'монитор', 'пк', 'системный', 'вычислительная'],
   'смартфон': ['телефон', 'аппарат', 'сотовый', 'мобильный', 'iphone', 'айфон'],
   'телефон': ['смартфон', 'мобильный', 'айфон'],
-  'одежд': ['платье', 'брюки', 'куртка', 'футболка', 'шорты', 'носки', 'текстиль'],
-  'брюк': ['одежда', 'штаны', 'джинсы'],
+  'одежд': ['платье', 'брюки', 'куртка', 'футболка', 'шорты', 'носки', 'текстиль', 'штаны'],
+  'брюк': ['одежда', 'штаны', 'джинсы', 'брюки'],
+  'штан': ['одежда', 'брюки', 'джинсы', 'брюк'],
   'обув': ['кроссовки', 'ботинки', 'кеды', 'сапоги', 'туфли', 'балетки'],
   'кроссовк': ['обувь', 'кеды', 'кросы', 'спортивная'],
   'кеды': ['обувь', 'кроссовки'],
@@ -32,12 +29,38 @@ const App: React.FC = () => {
   const [selectedCode, setSelectedCode] = useState<TNVEDCode | null>(POPULAR_LIBRARY[0]);
   const [isSearching, setIsSearching] = useState(false);
   const [searchResults, setSearchResults] = useState<TNVEDCode[]>([]);
+  const [viewingProduct, setViewingProduct] = useState<TNVEDCode | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
+  const [showScrollToSearch, setShowScrollToSearch] = useState(false);
   
   const [ratesUI, setRatesUI] = useState({
     USD: '91.8',
     CNY: '12.7',
     EUR: '98.5'
   });
+
+  // Отслеживание скролла для показа кнопки "К поиску"
+  useEffect(() => {
+    const handleScroll = () => {
+      const searchSection = document.getElementById('search-area');
+      if (searchSection) {
+        const rect = searchSection.getBoundingClientRect();
+        // Показываем кнопку, если верхняя часть поиска ушла за пределы экрана
+        setShowScrollToSearch(rect.bottom < 0);
+      }
+    };
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  // Закрытие попапа по ESC
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setViewingProduct(null);
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, []);
 
   const handleRateChange = (key: 'USD' | 'CNY' | 'EUR', value: string) => {
     if (/^[0-9\s.,]*$/.test(value) || value === '') {
@@ -58,9 +81,6 @@ const App: React.FC = () => {
     date: new Date().toLocaleDateString('ru-RU')
   };
 
-  /**
-   * Улучшенный стеммер: более агрессивно чистит окончания для точности сопоставления.
-   */
   const getStem = (word: string): string => {
     return word
       .toLowerCase()
@@ -73,75 +93,71 @@ const App: React.FC = () => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    // 1. Извлекаем чистые смысловые токены из запроса
-    const queryWords = trimmed.split(/\s+/).filter(w => w.length > 2);
+    const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2);
     if (queryWords.length === 0) return [];
 
     const queryStems = queryWords.map(w => getStem(w));
-    
-    // 2. Расширяем токены через карту ассоциаций (только если есть совпадения)
     const expandedSearchTerms = new Set<string>(queryStems);
+    
     queryStems.forEach(qs => {
       Object.entries(SEARCH_ASSET_MAP).forEach(([key, values]) => {
         const keyStem = getStem(key);
-        if (qs.includes(keyStem) || keyStem.includes(qs)) {
+        if (qs === keyStem || keyStem.startsWith(qs)) {
           values.forEach(v => expandedSearchTerms.add(getStem(v)));
         }
       });
     });
 
-    // 3. Проходим по базе данных с умным весовым ранжированием
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
-      let matchesCount = 0;
+      let matchedAny = false;
 
-      const itemName = item.name.toLowerCase();
-      const itemCat = item.category.toLowerCase();
-      const itemDesc = item.description.toLowerCase();
+      const nameTokens = item.name.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const descTokens = item.description.toLowerCase().split(/\s+/).map(w => getStem(w));
 
-      // Анализируем каждый токен поиска
       expandedSearchTerms.forEach(term => {
-        let termFound = false;
-
-        // Приоритет 1: Название товара (огромный вес)
-        if (getStem(itemName).includes(term)) {
-          score += 15;
-          termFound = true;
+        if (nameTokens.some(nt => nt === term)) {
+          score += 20;
+          matchedAny = true;
+        } else if (nameTokens.some(nt => nt.startsWith(term))) {
+          score += 10;
+          matchedAny = true;
         }
         
-        // Приоритет 2: Категория
-        if (getStem(itemCat).includes(term)) {
-          score += 8;
-          termFound = true;
+        if (catTokens.some(ct => ct === term)) {
+          score += 12;
+          matchedAny = true;
+        } else if (catTokens.some(ct => ct.startsWith(term))) {
+          score += 6;
+          matchedAny = true;
         }
 
-        // Приоритет 3: Описание (вспомогательный вес)
-        if (getStem(itemDesc).includes(term)) {
+        if (descTokens.some(dt => dt === term)) {
+          score += 4;
+          matchedAny = true;
+        } else if (descTokens.some(dt => dt.startsWith(term))) {
           score += 2;
-          termFound = true;
+          matchedAny = true;
         }
-
-        if (termFound) matchesCount++;
       });
 
-      // БОНУС: Если в товаре найдены ВСЕ слова из оригинального запроса
-      const allOriginalWordsFound = queryStems.every(qs => 
-        getStem(itemName).includes(qs) || getStem(itemCat).includes(qs) || getStem(itemDesc).includes(qs)
+      const allOriginalTermsFound = queryStems.every(qs => 
+        nameTokens.some(nt => nt.startsWith(qs)) || 
+        catTokens.some(ct => ct.startsWith(qs)) || 
+        descTokens.some(dt => dt.startsWith(qs))
       );
       
-      if (allOriginalWordsFound && queryStems.length > 1) {
-        score += 50; 
+      if (allOriginalTermsFound && queryStems.length > 1) {
+        score += 40; 
       }
 
-      // Порог релевантности: если не найдено ни одно из слов запроса напрямую (или через синоним), 
-      // либо вес слишком мал для большого количества слов — отсеиваем.
-      const relevanceThreshold = queryStems.length > 1 ? 10 : 5;
-
-      return { item, score, relevance: score >= relevanceThreshold };
+      const relevanceThreshold = queryStems.length > 1 ? 15 : 8;
+      return { item, score, relevance: matchedAny && score >= relevanceThreshold };
     });
 
     return scoredResults
-      .filter(res => res.relevance && res.score > 0)
+      .filter(res => res.relevance)
       .sort((a, b) => b.score - a.score)
       .map(res => res.item)
       .slice(0, 24);
@@ -150,11 +166,13 @@ const App: React.FC = () => {
   const triggerSearch = (query: string) => {
     setIsSearching(true);
     setSearchResults([]);
+    setHasSearched(false);
     
     setTimeout(() => {
       const results = handleSearchLocal(query);
       setSearchResults(results);
       setIsSearching(false);
+      setHasSearched(true);
       
       if (results.length > 0) {
         document.getElementById('search-results-anchor')?.scrollIntoView({ behavior: 'smooth' });
@@ -175,11 +193,87 @@ const App: React.FC = () => {
     }, 100);
   };
 
+  const scrollToSearch = () => {
+    document.getElementById('search-area')?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const showNoResultsHint = hasSearched && !isSearching && searchResults.length === 0;
+
   return (
     <div className="w-full bg-slate-50 min-h-screen pb-20 font-sans selection:bg-yellow-200">
-      <div className="max-w-7xl mx-auto px-4 pt-12 md:pt-24">
+      
+      {/* ПЛАВАЮЩАЯ КНОПКА "К ПОИСКУ" */}
+      {showScrollToSearch && (
+        <button 
+          onClick={scrollToSearch}
+          className="fixed bottom-8 right-8 z-[90] bg-slate-900 text-yellow-400 p-4 md:p-6 rounded-full shadow-2xl flex items-center gap-3 hover:scale-105 active:scale-95 transition-all animate-in slide-in-from-bottom-10"
+        >
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <span className="hidden md:inline font-black uppercase text-xs tracking-widest">К поиску</span>
+        </button>
+      )}
+
+      {/* МОДАЛЬНОЕ ОКНО ДЛЯ ПОДРОБНОЙ ИНФОРМАЦИИ */}
+      {viewingProduct && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8 animate-in fade-in duration-300">
+          <div 
+            className="absolute inset-0 bg-slate-900/60 backdrop-blur-md" 
+            onClick={() => setViewingProduct(null)}
+          ></div>
+          <div className="relative bg-white w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[3rem] shadow-2xl p-8 md:p-12 animate-in zoom-in-95 duration-300">
+            {/* Кнопка закрытия */}
+            <button 
+              onClick={() => setViewingProduct(null)}
+              className="absolute top-8 right-8 p-3 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-full transition-all active:scale-90"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+            </button>
+
+            <div className="flex flex-col gap-8">
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center gap-3">
+                  <span className="text-[10px] font-black uppercase text-blue-600 bg-blue-50 px-4 py-2 rounded-full tracking-widest">{viewingProduct.category}</span>
+                  <span className="font-mono text-sm font-black text-emerald-600 bg-emerald-50 px-4 py-2 rounded-xl">{viewingProduct.code}</span>
+                </div>
+                <h2 className="text-3xl md:text-4xl font-black text-slate-900 leading-tight">
+                  {viewingProduct.name}
+                </h2>
+              </div>
+
+              <div className="p-8 bg-slate-50 rounded-3xl border border-slate-100">
+                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Полное описание ТН ВЭД</h4>
+                <p className="text-lg text-slate-600 font-medium leading-relaxed italic">
+                  «{viewingProduct.description}»
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="bg-emerald-500 p-8 rounded-[2.5rem] text-white shadow-lg shadow-emerald-200">
+                  <span className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-2 block">Импортная пошлина</span>
+                  <div className="text-5xl font-black">{viewingProduct.importDuty}%</div>
+                </div>
+                <div className="bg-blue-600 p-8 rounded-[2.5rem] text-white shadow-lg shadow-blue-200">
+                  <span className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-2 block">Ставка НДС</span>
+                  <div className="text-5xl font-black">{viewingProduct.vat}%</div>
+                </div>
+              </div>
+
+              <button 
+                onClick={() => {
+                  selectProduct(viewingProduct);
+                  setViewingProduct(null);
+                }}
+                className="w-full py-6 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-lg uppercase tracking-widest shadow-xl"
+              >
+                Выбрать для расчета
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div id="search-area" className="max-w-7xl mx-auto px-4 pt-12 md:pt-24 scroll-mt-20">
         <div className="bg-[#0f172a] rounded-[3rem] p-8 md:p-24 text-white relative overflow-hidden shadow-2xl flex flex-col items-center justify-center">
-          {/* Декоративные элементы фона */}
           <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none opacity-20">
              <div className="absolute -top-24 -left-24 w-96 h-96 bg-yellow-400 rounded-full blur-[120px]"></div>
              <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-blue-500 rounded-full blur-[120px]"></div>
@@ -195,7 +289,7 @@ const App: React.FC = () => {
               Найдите код в <span className="text-yellow-400 italic">базе</span>
             </h1>
             <p className="text-slate-400 text-lg md:text-xl font-medium mb-12 max-w-2xl mx-auto leading-relaxed opacity-80">
-              Высокоточный поиск по 100 000+ позиций. Понимает смыслы, склонения и категории.
+              Умный поиск по базе ТН ВЭД. Нажмите на карточку, чтобы увидеть подробности.
             </p>
             <div className="flex flex-col gap-6 max-w-3xl mx-auto w-full">
               <form onSubmit={handleSearchClick} className="relative flex items-center bg-[#1e293b]/40 border border-slate-700/50 rounded-full p-2 pl-8 focus-within:border-yellow-400/50 transition-all shadow-inner backdrop-blur-sm">
@@ -214,6 +308,23 @@ const App: React.FC = () => {
                   {isSearching ? "Поиск..." : "Найти"}
                 </button>
               </form>
+
+              {/* УВЕДОМЛЕНИЕ ОБ ОШИБКЕ ПОИСКА */}
+              {showNoResultsHint && (
+                <div className="mt-4 animate-in slide-in-from-top-4 duration-300">
+                  <div className="bg-orange-500/10 border border-orange-500/20 rounded-3xl p-6 flex items-start gap-4 text-left backdrop-blur-sm">
+                    <div className="bg-orange-500 p-2 rounded-xl text-white shrink-0">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    </div>
+                    <div>
+                      <h4 className="font-black text-orange-500 text-sm uppercase tracking-wider mb-1">Ничего не найдено</h4>
+                      <p className="text-slate-300 text-sm leading-relaxed">
+                        Не удалось найти подходящий товар по вашему запросу. Возможно, стоит попробовать поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('электроника'); triggerSearch('электроника');}}>электроника</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('спортивный инвентарь'); triggerSearch('спортивный инвентарь');}}>спортивный инвентарь</span>.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -226,25 +337,30 @@ const App: React.FC = () => {
           <div className="flex items-center gap-4 mb-10">
             <div className="w-2 h-10 rounded-full bg-emerald-500 shadow-[0_0_15px_rgba(16,185,129,0.4)]"></div>
             <h2 className="text-3xl font-black text-slate-900 tracking-tight">
-              {searchResults.length > 0 ? 'Наиболее подходящие коды' : 'Ничего не найдено'}
+              {searchResults.length > 0 ? 'Подходящие позиции' : 'Ничего не найдено'}
             </h2>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 items-start">
             {isSearching ? (
               [1, 2, 3, 4, 5, 6].map(i => (
-                <div key={i} className="h-[280px] bg-white rounded-[3rem] border border-slate-100 animate-pulse p-8 shadow-sm"></div>
+                <div key={i} className="h-[320px] bg-white rounded-[3rem] border border-slate-100 animate-pulse p-8 shadow-sm"></div>
               ))
             ) : (
               searchResults.map((item, idx) => (
-                <div key={`${item.code}-${idx}`} className={`group relative p-8 rounded-[3.5rem] border-2 transition-all hover:shadow-2xl flex flex-col h-full ${selectedCode?.code === item.code ? 'border-emerald-400 bg-emerald-50/30' : 'border-white bg-white hover:border-slate-100'}`}>
+                <div 
+                  key={`${item.code}-${idx}`} 
+                  className={`group relative p-8 rounded-[3.5rem] border-2 transition-all hover:shadow-2xl flex flex-col h-full cursor-pointer ${selectedCode?.code === item.code ? 'border-emerald-400 bg-emerald-50/30' : 'border-white bg-white hover:border-slate-100'}`}
+                  onClick={() => setViewingProduct(item)}
+                >
                   <div className="relative z-10 flex flex-col h-full">
                     <div className="flex justify-between items-start mb-6">
                       <span className="text-[10px] font-black uppercase text-slate-400 bg-slate-100 px-3 py-1.5 rounded-full">{item.category}</span>
                       <div className="font-mono text-sm text-emerald-600 font-black bg-emerald-500/10 px-3 py-1.5 rounded-xl tracking-tighter">{item.code}</div>
                     </div>
-                    <h3 className="font-black text-slate-900 text-xl mb-3 leading-snug">{item.name}</h3>
-                    <p className="text-slate-500 text-sm font-medium mb-8 leading-relaxed line-clamp-2">{item.description}</p>
+                    <h3 className="font-black text-slate-900 text-xl mb-3 leading-snug line-clamp-2 group-hover:text-blue-600 transition-colors">{item.name}</h3>
+                    <p className="text-slate-500 text-sm font-medium mb-8 leading-relaxed line-clamp-3">{item.description}</p>
+                    
                     <div className="flex items-center gap-8 py-6 border-y border-slate-50 mt-auto mb-6">
                       <div className="flex flex-col">
                         <span className="text-[9px] font-black text-slate-400 uppercase">Пошлина</span>
@@ -255,9 +371,27 @@ const App: React.FC = () => {
                         <span className="text-lg font-black text-blue-600">{item.vat}%</span>
                       </div>
                     </div>
-                    <button onClick={() => selectProduct(item)} className="w-full py-5 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-xs uppercase tracking-widest shadow-lg shadow-slate-200">
-                      Добавить в расчет
-                    </button>
+                    
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          selectProduct(item);
+                        }} 
+                        className="flex-grow py-5 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-[10px] uppercase tracking-widest shadow-lg"
+                      >
+                        В расчет
+                      </button>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setViewingProduct(item);
+                        }}
+                        className="p-5 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-2xl transition-all active:scale-90"
+                      >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))
@@ -266,7 +400,18 @@ const App: React.FC = () => {
         </div>
       )}
 
-      <div id="calculator-section" className="max-w-7xl mx-auto px-4 mt-20 scroll-mt-10">
+      <div id="calculator-section" className="max-w-7xl mx-auto px-4 mt-20 scroll-mt-24">
+        {selectedCode && (
+          <div className="mb-10 flex justify-end">
+            <button 
+              onClick={scrollToSearch}
+              className="bg-white border border-slate-200 text-slate-900 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-50 transition-all flex items-center gap-3"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m11 17-5-5 5-5"/><path d="M18 17l-5-5 5-5"/></svg>
+              Вернуться к поиску
+            </button>
+          </div>
+        )}
         <Calculator 
           rates={rates}
           ratesUI={ratesUI}
