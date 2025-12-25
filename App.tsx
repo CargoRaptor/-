@@ -44,13 +44,22 @@ const App: React.FC = () => {
     if (!query.trim()) return [];
     const lowerQuery = query.toLowerCase();
     
-    return TNVED_DB.filter(item => {
-      return (
-        item.code.includes(lowerQuery) ||
-        item.name.toLowerCase().includes(lowerQuery) ||
-        item.description.toLowerCase().includes(lowerQuery)
-      );
-    }).slice(0, 20);
+    return TNVED_DB
+      .filter(item => {
+        const nameMatch = item.name.toLowerCase().includes(lowerQuery);
+        const descMatch = item.description.toLowerCase().includes(lowerQuery);
+        return nameMatch || descMatch;
+      })
+      .sort((a, b) => {
+        // Приоритет совпадениям в названии (name)
+        const aNameMatch = a.name.toLowerCase().includes(lowerQuery);
+        const bNameMatch = b.name.toLowerCase().includes(lowerQuery);
+        
+        if (aNameMatch && !bNameMatch) return -1;
+        if (!aNameMatch && bNameMatch) return 1;
+        return 0;
+      })
+      .slice(0, 20);
   };
 
   const triggerSearch = (query: string) => {
@@ -94,7 +103,7 @@ const App: React.FC = () => {
               Найдите код в <span className="text-yellow-400 italic">базе</span>
             </h1>
             <p className="text-slate-400 text-lg md:text-xl font-medium mb-12 max-w-2xl mx-auto leading-relaxed opacity-80">
-              Поиск по актуальным кодам ТН ВЭД. Используйте точный код или описание товара.
+              Поиск по актуальным кодам ТН ВЭД. Используйте описание товара для поиска.
             </p>
             <div className="flex flex-col gap-6 max-w-3xl mx-auto w-full">
               <form onSubmit={handleSearchClick} className="relative flex items-center bg-[#1e293b]/40 border border-slate-700/50 rounded-full p-2 pl-8 focus-within:border-yellow-400/50 transition-all shadow-inner backdrop-blur-sm">
@@ -102,7 +111,7 @@ const App: React.FC = () => {
                   type="text" 
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Например: электросамокат или 8703"
+                  placeholder="Например: электросамокат или ноутбук"
                   className="flex-grow bg-transparent border-none py-4 text-white text-lg placeholder:text-slate-500 focus:outline-none"
                 />
                 <button 

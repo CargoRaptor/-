@@ -5,6 +5,8 @@ export interface TNVEDCode {
   description: string;
   category: string;
   importDuty: number; // Процент
+  minDutyAmount?: number; // Минимальная сумма (например, 1)
+  minDutyCurrency?: Currency; // Валюта минимума (например, EUR)
   vat: number; // Процент
   excise?: number; // Опционально процент
   measureUnit: string;
@@ -29,7 +31,7 @@ export interface CalculationResult {
   exciseAmount: number;
   totalTaxes: number;
   bankCommission: number;
-  shippingCost: number; // Стоимость логистики
-  localServices: number; // Сумма Декларант + Агент + ТО
+  shippingCost: number; 
+  localServices: number; 
   grandTotal: number;
 }
