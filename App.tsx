@@ -3,26 +3,9 @@ import React, { useState, useEffect } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
 import { TNVED_DB } from './data/tnved_db';
+import { CATEGORY_MAP, SYNONYMS } from './data/search_maps';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
-
-const SEARCH_ASSET_MAP: Record<string, string[]> = {
-  'ноут': ['ноутбук', 'компьютер', 'лэптоп', 'вычислительная'],
-  'комп': ['ноутбук', 'монитор', 'пк', 'системный', 'вычислительная'],
-  'смартфон': ['телефон', 'аппарат', 'сотовый', 'мобильный', 'iphone', 'айфон'],
-  'телефон': ['смартфон', 'мобильный', 'айфон'],
-  'одежд': ['платье', 'брюки', 'куртка', 'футболка', 'шорты', 'носки', 'текстиль', 'штаны'],
-  'брюк': ['одежда', 'штаны', 'джинсы', 'брюки'],
-  'штан': ['одежда', 'брюки', 'джинсы', 'брюк'],
-  'обув': ['кроссовки', 'ботинки', 'кеды', 'сапоги', 'туфли', 'балетки'],
-  'кроссовк': ['обувь', 'кеды', 'кросы', 'спортивная'],
-  'кеды': ['обувь', 'кроссовки'],
-  'запчаст': ['авто', 'детали', 'компоненты', 'бампер', 'радиатор', 'фара', 'фильтр'],
-  'авто': ['машина', 'транспорт', 'запчасти'],
-  'еда': ['продукты', 'питание', 'бакалея'],
-  'косметик': ['крем', 'шампунь', 'мыло', 'химия', 'уход'],
-  'игрушк': ['детское', 'кукла', 'конструктор', 'пазл'],
-};
 
 const App: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -39,13 +22,27 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
+  // Инвертированный словарь синонимов для быстрого поиска префиксов по слову
+  const [termToPrefixes, setTermToPrefixes] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    const map: Record<string, string[]> = {};
+    Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
+      terms.forEach(term => {
+        const stem = getStem(term);
+        if (!map[stem]) map[stem] = [];
+        if (!map[stem].includes(prefix)) map[stem].push(prefix);
+      });
+    });
+    setTermToPrefixes(map);
+  }, []);
+
   // Отслеживание скролла для показа кнопки "К поиску"
   useEffect(() => {
     const handleScroll = () => {
       const searchSection = document.getElementById('search-area');
       if (searchSection) {
         const rect = searchSection.getBoundingClientRect();
-        // Показываем кнопку, если верхняя часть поиска ушла за пределы экрана
         setShowScrollToSearch(rect.bottom < 0);
       }
     };
@@ -97,13 +94,24 @@ const App: React.FC = () => {
     if (queryWords.length === 0) return [];
 
     const queryStems = queryWords.map(w => getStem(w));
-    const expandedSearchTerms = new Set<string>(queryStems);
     
-    queryStems.forEach(qs => {
-      Object.entries(SEARCH_ASSET_MAP).forEach(([key, values]) => {
-        const keyStem = getStem(key);
-        if (qs === keyStem || keyStem.startsWith(qs)) {
-          values.forEach(v => expandedSearchTerms.add(getStem(v)));
+    // Поиск префиксов кодов через словарь синонимов
+    const matchedPrefixes = new Set<string>();
+    queryStems.forEach(stem => {
+      Object.keys(termToPrefixes).forEach(termStem => {
+        if (termStem.startsWith(stem) || stem.startsWith(termStem)) {
+          termToPrefixes[termStem].forEach(p => matchedPrefixes.add(p));
+        }
+      });
+    });
+
+    // Поиск совпадений в CATEGORY_MAP
+    const matchedCategoryPrefixes = new Set<string>();
+    queryStems.forEach(stem => {
+      Object.entries(CATEGORY_MAP).forEach(([prefix, name]) => {
+        const catNameStems = name.toLowerCase().split(/[\s/]+/).map(w => getStem(w));
+        if (catNameStems.some(cs => cs.startsWith(stem) || stem.startsWith(cs))) {
+          matchedCategoryPrefixes.add(prefix);
         }
       });
     });
@@ -116,44 +124,50 @@ const App: React.FC = () => {
       const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
       const descTokens = item.description.toLowerCase().split(/\s+/).map(w => getStem(w));
 
-      expandedSearchTerms.forEach(term => {
+      // 1. Прямой текстовый поиск
+      queryStems.forEach(term => {
         if (nameTokens.some(nt => nt === term)) {
-          score += 20;
-          matchedAny = true;
+          score += 20; matchedAny = true;
         } else if (nameTokens.some(nt => nt.startsWith(term))) {
-          score += 10;
-          matchedAny = true;
+          score += 10; matchedAny = true;
         }
         
         if (catTokens.some(ct => ct === term)) {
-          score += 12;
-          matchedAny = true;
+          score += 12; matchedAny = true;
         } else if (catTokens.some(ct => ct.startsWith(term))) {
-          score += 6;
-          matchedAny = true;
+          score += 6; matchedAny = true;
         }
 
         if (descTokens.some(dt => dt === term)) {
-          score += 4;
-          matchedAny = true;
-        } else if (descTokens.some(dt => dt.startsWith(term))) {
-          score += 2;
+          score += 4; matchedAny = true;
+        }
+      });
+
+      // 2. Поиск через словарь СИНОНИМОВ (самый сильный буст)
+      matchedPrefixes.forEach(prefix => {
+        if (item.code.startsWith(prefix)) {
+          score += 50;
           matchedAny = true;
         }
       });
 
-      const allOriginalTermsFound = queryStems.every(qs => 
+      // 3. Поиск через CATEGORY_MAP
+      matchedCategoryPrefixes.forEach(prefix => {
+        if (item.code.startsWith(prefix)) {
+          score += 30;
+          matchedAny = true;
+        }
+      });
+
+      // 4. Бонус за совпадение всех слов запроса
+      const allWordsFound = queryStems.every(qs => 
         nameTokens.some(nt => nt.startsWith(qs)) || 
         catTokens.some(ct => ct.startsWith(qs)) || 
         descTokens.some(dt => dt.startsWith(qs))
       );
-      
-      if (allOriginalTermsFound && queryStems.length > 1) {
-        score += 40; 
-      }
+      if (allWordsFound && queryStems.length > 1) score += 40;
 
-      const relevanceThreshold = queryStems.length > 1 ? 15 : 8;
-      return { item, score, relevance: matchedAny && score >= relevanceThreshold };
+      return { item, score, relevance: matchedAny && score >= 10 };
     });
 
     return scoredResults
@@ -202,7 +216,6 @@ const App: React.FC = () => {
   return (
     <div className="w-full bg-slate-50 min-h-screen pb-20 font-sans selection:bg-yellow-200">
       
-      {/* ПЛАВАЮЩАЯ КНОПКА "К ПОИСКУ" */}
       {showScrollToSearch && (
         <button 
           onClick={scrollToSearch}
@@ -213,40 +226,25 @@ const App: React.FC = () => {
         </button>
       )}
 
-      {/* МОДАЛЬНОЕ ОКНО ДЛЯ ПОДРОБНОЙ ИНФОРМАЦИИ */}
       {viewingProduct && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8 animate-in fade-in duration-300">
-          <div 
-            className="absolute inset-0 bg-slate-900/60 backdrop-blur-md" 
-            onClick={() => setViewingProduct(null)}
-          ></div>
+          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-md" onClick={() => setViewingProduct(null)}></div>
           <div className="relative bg-white w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[3rem] shadow-2xl p-8 md:p-12 animate-in zoom-in-95 duration-300">
-            {/* Кнопка закрытия */}
-            <button 
-              onClick={() => setViewingProduct(null)}
-              className="absolute top-8 right-8 p-3 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-full transition-all active:scale-90"
-            >
+            <button onClick={() => setViewingProduct(null)} className="absolute top-8 right-8 p-3 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-full transition-all active:scale-90">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
             </button>
-
             <div className="flex flex-col gap-8">
               <div className="flex flex-col gap-4">
                 <div className="flex items-center gap-3">
                   <span className="text-[10px] font-black uppercase text-blue-600 bg-blue-50 px-4 py-2 rounded-full tracking-widest">{viewingProduct.category}</span>
                   <span className="font-mono text-sm font-black text-emerald-600 bg-emerald-50 px-4 py-2 rounded-xl">{viewingProduct.code}</span>
                 </div>
-                <h2 className="text-3xl md:text-4xl font-black text-slate-900 leading-tight">
-                  {viewingProduct.name}
-                </h2>
+                <h2 className="text-3xl md:text-4xl font-black text-slate-900 leading-tight">{viewingProduct.name}</h2>
               </div>
-
               <div className="p-8 bg-slate-50 rounded-3xl border border-slate-100">
                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Полное описание ТН ВЭД</h4>
-                <p className="text-lg text-slate-600 font-medium leading-relaxed italic">
-                  «{viewingProduct.description}»
-                </p>
+                <p className="text-lg text-slate-600 font-medium leading-relaxed italic">«{viewingProduct.description}»</p>
               </div>
-
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="bg-emerald-500 p-8 rounded-[2.5rem] text-white shadow-lg shadow-emerald-200">
                   <span className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-2 block">Импортная пошлина</span>
@@ -257,14 +255,7 @@ const App: React.FC = () => {
                   <div className="text-5xl font-black">{viewingProduct.vat}%</div>
                 </div>
               </div>
-
-              <button 
-                onClick={() => {
-                  selectProduct(viewingProduct);
-                  setViewingProduct(null);
-                }}
-                className="w-full py-6 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-lg uppercase tracking-widest shadow-xl"
-              >
+              <button onClick={() => { selectProduct(viewingProduct); setViewingProduct(null); }} className="w-full py-6 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-lg uppercase tracking-widest shadow-xl">
                 Выбрать для расчета
               </button>
             </div>
@@ -278,12 +269,9 @@ const App: React.FC = () => {
              <div className="absolute -top-24 -left-24 w-96 h-96 bg-yellow-400 rounded-full blur-[120px]"></div>
              <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-blue-500 rounded-full blur-[120px]"></div>
           </div>
-
           <div className="relative z-10 max-w-4xl mx-auto text-center w-full">
             <div className="inline-flex items-center justify-center border border-yellow-400/20 bg-yellow-400/5 px-6 py-2 rounded-full mb-12">
-               <span className="text-[10px] font-black text-yellow-400 uppercase tracking-[0.2em]">
-                 ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК ТН ВЭД
-               </span>
+               <span className="text-[10px] font-black text-yellow-400 uppercase tracking-[0.2em]">ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК ТН ВЭД</span>
             </div>
             <h1 className="text-4xl md:text-7xl font-black mb-6 leading-tight tracking-tight">
               Найдите код в <span className="text-yellow-400 italic">базе</span>
@@ -300,16 +288,10 @@ const App: React.FC = () => {
                   placeholder="Введите название товара..."
                   className="flex-grow bg-transparent border-none py-4 text-white text-lg placeholder:text-slate-500 focus:outline-none"
                 />
-                <button 
-                  type="submit"
-                  disabled={isSearching}
-                  className="bg-yellow-400 hover:bg-yellow-300 text-slate-950 font-black px-12 py-4 rounded-full transition-all active:scale-95 disabled:opacity-70 text-lg shadow-lg"
-                >
+                <button type="submit" disabled={isSearching} className="bg-yellow-400 hover:bg-yellow-300 text-slate-950 font-black px-12 py-4 rounded-full transition-all active:scale-95 disabled:opacity-70 text-lg shadow-lg">
                   {isSearching ? "Поиск..." : "Найти"}
                 </button>
               </form>
-
-              {/* УВЕДОМЛЕНИЕ ОБ ОШИБКЕ ПОИСКА */}
               {showNoResultsHint && (
                 <div className="mt-4 animate-in slide-in-from-top-4 duration-300">
                   <div className="bg-orange-500/10 border border-orange-500/20 rounded-3xl p-6 flex items-start gap-4 text-left backdrop-blur-sm">
@@ -319,7 +301,7 @@ const App: React.FC = () => {
                     <div>
                       <h4 className="font-black text-orange-500 text-sm uppercase tracking-wider mb-1">Ничего не найдено</h4>
                       <p className="text-slate-300 text-sm leading-relaxed">
-                        Не удалось найти подходящий товар по вашему запросу. Возможно, стоит попробовать поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('электроника'); triggerSearch('электроника');}}>электроника</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('спортивный инвентарь'); triggerSearch('спортивный инвентарь');}}>спортивный инвентарь</span>.
+                        Попробуйте поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('электроника'); triggerSearch('электроника');}}>электроника</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('инструмент'); triggerSearch('инструмент');}}>инструмент</span>.
                       </p>
                     </div>
                   </div>
@@ -340,19 +322,12 @@ const App: React.FC = () => {
               {searchResults.length > 0 ? 'Подходящие позиции' : 'Ничего не найдено'}
             </h2>
           </div>
-
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 items-start">
             {isSearching ? (
-              [1, 2, 3, 4, 5, 6].map(i => (
-                <div key={i} className="h-[320px] bg-white rounded-[3rem] border border-slate-100 animate-pulse p-8 shadow-sm"></div>
-              ))
+              [1, 2, 3, 4, 5, 6].map(i => <div key={i} className="h-[320px] bg-white rounded-[3rem] border border-slate-100 animate-pulse p-8 shadow-sm"></div>)
             ) : (
               searchResults.map((item, idx) => (
-                <div 
-                  key={`${item.code}-${idx}`} 
-                  className={`group relative p-8 rounded-[3.5rem] border-2 transition-all hover:shadow-2xl flex flex-col h-full cursor-pointer ${selectedCode?.code === item.code ? 'border-emerald-400 bg-emerald-50/30' : 'border-white bg-white hover:border-slate-100'}`}
-                  onClick={() => setViewingProduct(item)}
-                >
+                <div key={`${item.code}-${idx}`} className={`group relative p-8 rounded-[3.5rem] border-2 transition-all hover:shadow-2xl flex flex-col h-full cursor-pointer ${selectedCode?.code === item.code ? 'border-emerald-400 bg-emerald-50/30' : 'border-white bg-white hover:border-slate-100'}`} onClick={() => setViewingProduct(item)}>
                   <div className="relative z-10 flex flex-col h-full">
                     <div className="flex justify-between items-start mb-6">
                       <span className="text-[10px] font-black uppercase text-slate-400 bg-slate-100 px-3 py-1.5 rounded-full">{item.category}</span>
@@ -360,7 +335,6 @@ const App: React.FC = () => {
                     </div>
                     <h3 className="font-black text-slate-900 text-xl mb-3 leading-snug line-clamp-2 group-hover:text-blue-600 transition-colors">{item.name}</h3>
                     <p className="text-slate-500 text-sm font-medium mb-8 leading-relaxed line-clamp-3">{item.description}</p>
-                    
                     <div className="flex items-center gap-8 py-6 border-y border-slate-50 mt-auto mb-6">
                       <div className="flex flex-col">
                         <span className="text-[9px] font-black text-slate-400 uppercase">Пошлина</span>
@@ -371,24 +345,9 @@ const App: React.FC = () => {
                         <span className="text-lg font-black text-blue-600">{item.vat}%</span>
                       </div>
                     </div>
-                    
                     <div className="flex gap-2">
-                      <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          selectProduct(item);
-                        }} 
-                        className="flex-grow py-5 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-[10px] uppercase tracking-widest shadow-lg"
-                      >
-                        В расчет
-                      </button>
-                      <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setViewingProduct(item);
-                        }}
-                        className="p-5 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-2xl transition-all active:scale-90"
-                      >
+                      <button onClick={(e) => { e.stopPropagation(); selectProduct(item); }} className="flex-grow py-5 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-[10px] uppercase tracking-widest shadow-lg">В расчет</button>
+                      <button onClick={(e) => { e.stopPropagation(); setViewingProduct(item); }} className="p-5 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-2xl transition-all active:scale-90">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
                       </button>
                     </div>
@@ -403,10 +362,7 @@ const App: React.FC = () => {
       <div id="calculator-section" className="max-w-7xl mx-auto px-4 mt-20 scroll-mt-24">
         {selectedCode && (
           <div className="mb-10 flex justify-end">
-            <button 
-              onClick={scrollToSearch}
-              className="bg-white border border-slate-200 text-slate-900 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-50 transition-all flex items-center gap-3"
-            >
+            <button onClick={scrollToSearch} className="bg-white border border-slate-200 text-slate-900 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-50 transition-all flex items-center gap-3">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m11 17-5-5 5-5"/><path d="M18 17l-5-5 5-5"/></svg>
               Вернуться к поиску
             </button>
@@ -420,9 +376,7 @@ const App: React.FC = () => {
           onCodeChange={(code) => {
             const found = TNVED_DB.find(l => l.code === code);
             if (found) setSelectedCode(found);
-            setTimeout(() => {
-              document.getElementById('calculator-section')?.scrollIntoView({ behavior: 'smooth' });
-            }, 100);
+            setTimeout(() => { document.getElementById('calculator-section')?.scrollIntoView({ behavior: 'smooth' }); }, 100);
           }}
         />
       </div>
