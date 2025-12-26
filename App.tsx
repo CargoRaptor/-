@@ -1,16 +1,17 @@
-
 import React, { useState, useEffect, useMemo } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
 import { TNVED_DB } from './data/tnved_db';
 import { CATEGORY_MAP, SYNONYMS } from './data/search_maps';
 
+// Популярные коды для быстрого старта (например, телефоны, ноутбуки)
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
-// Расширенный список стоп-слов для фильтрации мусора в запросах
+// Стоп-слова (предлоги и мусор), которые мы игнорируем при поиске
 const STOP_WORDS = new Set([
   'для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой', 'такой', 
-  'сверху', 'снизу', 'внутри', 'комплект', 'набор', 'шт', 'кг', 'с', 'и', 'в', 'на'
+  'сверху', 'снизу', 'внутри', 'комплект', 'набор', 'шт', 'кг', 'с', 'и', 'в', 'на', 
+  'прочие', 'кроме', 'том', 'числе'
 ]);
 
 const App: React.FC = () => {
@@ -22,339 +23,248 @@ const App: React.FC = () => {
   const [hasSearched, setHasSearched] = useState(false);
   const [showScrollToSearch, setShowScrollToSearch] = useState(false);
   
+  // Курсы валют (можно подключить API ЦБ РФ, пока хардкод для примера)
   const [ratesUI, setRatesUI] = useState({
     USD: '91.8',
-    CNY: '12.7',
-    EUR: '98.5'
+    EUR: '99.5',
+    CNY: '12.6'
   });
 
-  // Пре-индексация синонимов для ускорения поиска
-  const termToPrefixData = useMemo(() => {
-    const map: Record<string, {prefix: string, isSpecific: boolean}[]> = {};
-    Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
-      terms.forEach(term => {
-        const stem = getStem(term);
-        if (!map[stem]) map[stem] = [];
-        map[stem].push({ prefix, isSpecific: prefix.length >= 4 });
-      });
-    });
-    return map;
-  }, []);
+  const rates: ExchangeRates = useMemo(() => ({
+    USD: parseFloat(ratesUI.USD) || 0,
+    EUR: parseFloat(ratesUI.EUR) || 0,
+    CNY: parseFloat(ratesUI.CNY) || 0,
+  }), [ratesUI]);
 
+  // --- ГЛАВНАЯ ЛОГИКА ПОИСКА ---
   useEffect(() => {
-    const handleScroll = () => {
-      const searchSection = document.getElementById('search-area');
-      if (searchSection) {
-        const rect = searchSection.getBoundingClientRect();
-        setShowScrollToSearch(rect.bottom < 0);
-      }
-    };
-    window.addEventListener('scroll', handleScroll);
-    return () => window.removeEventListener('scroll', handleScroll);
-  }, []);
-
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setViewingProduct(null);
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, []);
-
-  const handleRateChange = (key: 'USD' | 'CNY' | 'EUR', value: string) => {
-    if (/^[0-9\s.,]*$/.test(value) || value === '') {
-      setRatesUI(prev => ({ ...prev, [key]: value }));
-    }
-  };
-
-  const parseNum = (val: string) => {
-    const clean = val.replace(/\s/g, '').replace(',', '.');
-    const n = parseFloat(clean);
-    return isNaN(n) ? 0 : n;
-  };
-
-  const rates: ExchangeRates = {
-    USD: parseNum(ratesUI.USD),
-    CNY: parseNum(ratesUI.CNY),
-    EUR: parseNum(ratesUI.EUR),
-    date: new Date().toLocaleDateString('ru-RU')
-  };
-
-  // Универсальный стеммер для русского языка
-  function getStem(word: string): string {
-    return word
-      .toLowerCase()
-      .trim()
-      .replace(/[.,!?;:]/g, '')
-      // Убираем падежные окончания, множественное число и суффиксы прилагательных
-      .replace(/(иями|ями|иям|ям|иях|ях|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
-  }
-
-  const handleSearchLocal = (query: string) => {
-    const trimmed = query.trim().toLowerCase();
-    if (trimmed.length < 2) return [];
-
-    // 1. Разбиваем на токены, убирая "шум"
-    const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
-    if (queryWords.length === 0) return [];
-    const queryStems = queryWords.map(w => getStem(w));
-    
-    // 2. Находим потенциальные коды через синонимы
-    const synonymMatches = new Map<string, {isSpecific: boolean, weight: number}>();
-    queryStems.forEach(stem => {
-      Object.keys(termToPrefixData).forEach(termStem => {
-        if (termStem === stem || (termStem.length > 3 && (termStem.startsWith(stem) || stem.startsWith(termStem)))) {
-          termToPrefixData[termStem].forEach(data => {
-            const current = synonymMatches.get(data.prefix);
-            const weight = termStem === stem ? 500 : 200;
-            if (!current || weight > current.weight) {
-              synonymMatches.set(data.prefix, { isSpecific: data.isSpecific, weight });
-            }
-          });
-        }
-      });
-    });
-
-    // 3. Ранжируем всю базу данных
-    const scoredResults = TNVED_DB.map(item => {
-      let score = 0;
-      let matchedStems = new Set<string>();
-      let titleMatchCount = 0;
-
-      const title = item.name.toLowerCase();
-      const titleTokens = title.split(/\s+/).map(w => getStem(w));
-      const categoryTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
-      const description = item.description.toLowerCase();
-
-      // А) Бонус за синонимы
-      synonymMatches.forEach((data, prefix) => {
-        if (item.code.startsWith(prefix)) {
-          score += data.weight;
-          // Если код специфичный (4+ цифры), это очень сильный сигнал
-          if (data.isSpecific) score += 300;
-        }
-      });
-
-      // Б) Бонус за вхождение в заголовок (самый важный фактор)
-      queryStems.forEach(stem => {
-        // Точное совпадение корня в названии
-        if (titleTokens.includes(stem)) {
-          score += 1000;
-          titleMatchCount++;
-          matchedStems.add(stem);
-        } else if (title.includes(stem)) {
-          // Частичное вхождение (например "запчасть" в "автозапчасти")
-          score += 400;
-          titleMatchCount++;
-          matchedStems.add(stem);
-        }
-
-        // Вхождение в категорию (меньший приоритет)
-        if (categoryTokens.includes(stem)) {
-          score += 100;
-          matchedStems.add(stem);
-        }
-
-        // Вхождение в описание (минимальный приоритет, чтобы не было "галлюцинаций")
-        if (description.includes(stem)) {
-          score += 20;
-          matchedStems.add(stem);
-        }
-      });
-
-      // КРИТИЧЕСКИЙ ФИЛЬТР: 
-      // 1. Если в запросе 2+ слова, но в заголовке/синонимах нет ни одного — товар нерелевантен.
-      // 2. Если это "туша говяжья", в ней нет корня "бутылк", поэтому она получит 0 баллов и не пройдет.
-      const hasAnySignificantMatch = titleMatchCount > 0 || (synonymMatches.size > 0 && Array.from(synonymMatches.keys()).some(p => item.code.startsWith(p)));
-      
-      // Если запрос сложный, требуем чтобы хотя бы половина слов была найдена
-      // Fix: queryStems is a string array, so we must use .length instead of .size
-      const matchDensity = matchedStems.size / queryStems.length;
-      const isRelevant = hasAnySignificantMatch && (queryStems.length === 1 ? score > 50 : matchDensity >= 0.4);
-
-      return { item, score, relevance: isRelevant };
-    });
-
-    return scoredResults
-      .filter(res => res.relevance)
-      .sort((a, b) => b.score - a.score)
-      .map(res => res.item)
-      .slice(0, 24);
-  };
-
-  const triggerSearch = (query: string) => {
-    setIsSearching(true);
-    setSearchResults([]);
-    setHasSearched(false);
-    
-    setTimeout(() => {
-      const results = handleSearchLocal(query);
-      setSearchResults(results);
+    // 1. Если запрос пустой, очищаем результаты
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
       setIsSearching(false);
-      setHasSearched(true);
-      
-      if (results.length > 0) {
-        document.getElementById('search-results-anchor')?.scrollIntoView({ behavior: 'smooth' });
-      }
-    }, 250);
+      setHasSearched(false);
+      return;
+    }
+
+    setIsSearching(true);
+    setHasSearched(true);
+
+    // 2. Подготовка запроса
+    // Приводим к нижнему регистру и разбиваем на слова, убирая стоп-слова
+    const rawQuery = searchQuery.toLowerCase().trim();
+    const queryTokens = rawQuery
+      .split(/[\s,.-]+/) // разбиваем по пробелам, запятым, точкам
+      .filter(token => token.length > 1 && !STOP_WORDS.has(token));
+
+    // Если остались только стоп-слова или пустота, не ищем
+    if (queryTokens.length === 0 && rawQuery.length < 3) {
+      setIsSearching(false);
+      return;
+    }
+
+    // 3. Таймер для оптимизации (debounce), чтобы не тормозило при вводе
+    const timeoutId = setTimeout(() => {
+      const results = TNVED_DB.filter(item => {
+        const itemCode = item.code;
+        const itemName = item.name.toLowerCase();
+        const itemDesc = item.description.toLowerCase();
+        
+        // Получаем ключ группы (первые 4 цифры) для поиска синонимов
+        const groupKey = itemCode.substring(0, 4);
+        const itemSynonyms = SYNONYMS[groupKey] || [];
+
+        // Проверяем каждое слово из запроса
+        // Режим "AND": товар должен соответствовать хотя бы одному значимому слову или полному коду
+        return queryTokens.some(token => {
+          // А. Точное совпадение кода (или начало кода)
+          if (itemCode.startsWith(rawQuery)) return true;
+
+          // Б. Поиск в названии
+          if (itemName.includes(token)) return true;
+
+          // В. Поиск в синонимах
+          if (itemSynonyms.some(s => s.toLowerCase().includes(token))) return true;
+
+          // Г. Поиск в описании (самый низкий приоритет)
+          if (itemDesc.includes(token)) return true;
+
+          return false;
+        });
+      });
+
+      // 4. СОРТИРОВКА (Самая важная часть для релевантности)
+      results.sort((a, b) => {
+        const aName = a.name.toLowerCase();
+        const bName = b.name.toLowerCase();
+        const aDesc = a.description.toLowerCase();
+        const bDesc = b.description.toLowerCase();
+
+        // Фактор 1: Точное совпадение названия с запросом (Абсолютный лидер)
+        if (aName === rawQuery && bName !== rawQuery) return -1;
+        if (bName === rawQuery && aName !== rawQuery) return 1;
+
+        // Фактор 2: Запрос содержится в НАЗВАНИИ (Выше, чем в описании)
+        const aNameHas = queryTokens.some(t => aName.includes(t));
+        const bNameHas = queryTokens.some(t => bName.includes(t));
+        
+        if (aNameHas && !bNameHas) return -1; // A лучше
+        if (!aNameHas && bNameHas) return 1;  // B лучше
+
+        // Фактор 3: Короткие коды/названия обычно более общие и важные
+        // (Например "Насос" лучше, чем "Части насосов")
+        if (aNameHas && bNameHas) {
+            return a.name.length - b.name.length;
+        }
+
+        // Фактор 4: Совпадение в СИНОНИМАХ (Если не в названии)
+        const aGroup = a.code.substring(0, 4);
+        const bGroup = b.code.substring(0, 4);
+        const aSyns = SYNONYMS[aGroup] || [];
+        const bSyns = SYNONYMS[bGroup] || [];
+        
+        const aSynHas = queryTokens.some(t => aSyns.some(s => s.toLowerCase().includes(t)));
+        const bSynHas = queryTokens.some(t => bSyns.some(s => s.toLowerCase().includes(t)));
+
+        if (aSynHas && !bSynHas) return -1;
+        if (!aSynHas && bSynHas) return 1;
+
+        // Остальное (описание) уже отсортировано как "менее важное"
+        return 0;
+      });
+
+      // Ограничиваем выдачу 50 результатами для скорости
+      setSearchResults(results.slice(0, 50));
+      setIsSearching(false);
+    }, 300); // 300мс задержка
+
+    return () => clearTimeout(timeoutId);
+  }, [searchQuery]);
+
+  // --- UI handlers ---
+  const handleRateChange = (currency: keyof typeof ratesUI, value: string) => {
+    setRatesUI(prev => ({ ...prev, [currency]: value }));
   };
 
-  const handleSearchClick = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!searchQuery.trim()) return;
-    triggerSearch(searchQuery);
-  };
-
-  const selectProduct = (item: TNVEDCode) => {
-    setSelectedCode(item);
+  const handleSelectCode = (code: TNVEDCode) => {
+    setSelectedCode(code);
+    setViewingProduct(null); // Закрыть модалку/детали списка если есть
+    
+    // Плавный скролл к калькулятору
     setTimeout(() => {
       document.getElementById('calculator-section')?.scrollIntoView({ behavior: 'smooth' });
     }, 100);
   };
 
   const scrollToSearch = () => {
-    document.getElementById('search-area')?.scrollIntoView({ behavior: 'smooth' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const showNoResultsHint = hasSearched && !isSearching && searchResults.length === 0;
+  // Следим за скроллом для кнопки "Вернуться"
+  useEffect(() => {
+    const handleScroll = () => {
+      setShowScrollToSearch(window.scrollY > 400);
+    };
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
 
   return (
-    <div className="w-full bg-slate-50 min-h-screen pb-20 font-sans selection:bg-yellow-200">
+    <div className="min-h-screen bg-slate-50 font-sans text-slate-900 pb-20">
       
-      {showScrollToSearch && (
-        <button 
-          onClick={scrollToSearch}
-          className="fixed bottom-8 right-8 z-[90] bg-slate-900 text-yellow-400 p-4 md:p-6 rounded-full shadow-2xl flex items-center gap-3 hover:scale-105 active:scale-95 transition-all animate-in slide-in-from-bottom-10"
-        >
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-          <span className="hidden md:inline font-black uppercase text-xs tracking-widest">К поиску</span>
-        </button>
-      )}
-
-      {viewingProduct && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8 animate-in fade-in duration-300">
-          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-md" onClick={() => setViewingProduct(null)}></div>
-          <div className="relative bg-white w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[3rem] shadow-2xl p-8 md:p-12 animate-in zoom-in-95 duration-300">
-            <button onClick={() => setViewingProduct(null)} className="absolute top-8 right-8 p-3 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-full transition-all active:scale-90">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-            </button>
-            <div className="flex flex-col gap-8">
-              <div className="flex flex-col gap-4">
-                <div className="flex items-center gap-3">
-                  <span className="text-[10px] font-black uppercase text-blue-600 bg-blue-50 px-4 py-2 rounded-full tracking-widest">{viewingProduct.category}</span>
-                  <span className="font-mono text-sm font-black text-emerald-600 bg-emerald-50 px-4 py-2 rounded-xl">{viewingProduct.code}</span>
-                </div>
-                <h2 className="text-3xl md:text-4xl font-black text-slate-900 leading-tight">{viewingProduct.name}</h2>
-              </div>
-              <div className="p-8 bg-slate-50 rounded-3xl border border-slate-100">
-                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Полное описание ТН ВЭД</h4>
-                <p className="text-lg text-slate-600 font-medium leading-relaxed italic">«{viewingProduct.description}»</p>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="bg-emerald-500 p-8 rounded-[2.5rem] text-white shadow-lg shadow-emerald-200">
-                  <span className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-2 block">Импортная пошлина</span>
-                  <div className="text-5xl font-black">{viewingProduct.importDuty}%</div>
-                </div>
-                <div className="bg-blue-600 p-8 rounded-[2.5rem] text-white shadow-lg shadow-blue-200">
-                  <span className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-2 block">Ставка НДС</span>
-                  <div className="text-5xl font-black">{viewingProduct.vat}%</div>
-                </div>
-              </div>
-              <button onClick={() => { selectProduct(viewingProduct); setViewingProduct(null); }} className="w-full py-6 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-lg uppercase tracking-widest shadow-xl">
-                Выбрать для расчета
-              </button>
-            </div>
-          </div>
+      {/* HEADER & SEARCH */}
+      <div className="bg-slate-900 text-white pt-16 pb-24 px-4 rounded-b-[2.5rem] shadow-2xl relative overflow-hidden">
+        {/* Background decorations */}
+        <div className="absolute top-0 left-0 w-full h-full overflow-hidden opacity-10 pointer-events-none">
+             <div className="absolute -top-24 -right-24 w-96 h-96 bg-blue-500 rounded-full blur-3xl"></div>
+             <div className="absolute top-1/2 -left-24 w-72 h-72 bg-purple-500 rounded-full blur-3xl"></div>
         </div>
-      )}
 
-      <div id="search-area" className="max-w-7xl mx-auto px-4 pt-12 md:pt-24 scroll-mt-20">
-        <div className="bg-[#0f172a] rounded-[3rem] p-8 md:p-24 text-white relative overflow-hidden shadow-2xl flex flex-col items-center justify-center">
-          <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none opacity-20">
-             <div className="absolute -top-24 -left-24 w-96 h-96 bg-yellow-400 rounded-full blur-[120px]"></div>
-             <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-blue-500 rounded-full blur-[120px]"></div>
-          </div>
-          <div className="relative z-10 max-w-4xl mx-auto text-center w-full">
-            <div className="inline-flex items-center justify-center border border-yellow-400/20 bg-yellow-400/5 px-6 py-2 rounded-full mb-12">
-               <span className="text-[10px] font-black text-yellow-400 uppercase tracking-[0.2em]">ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК ТН ВЭД</span>
-            </div>
-            <h1 className="text-4xl md:text-7xl font-black mb-6 leading-tight tracking-tight">
-              Найдите код в <span className="text-yellow-400 italic">базе</span>
-            </h1>
-            <p className="text-slate-400 text-lg md:text-xl font-medium mb-12 max-w-2xl mx-auto leading-relaxed opacity-80">
-              Умный поиск по базе ТН ВЭД. Нажмите на карточку, чтобы увидеть подробности.
-            </p>
-            <div className="flex flex-col gap-6 max-w-3xl mx-auto w-full">
-              <form onSubmit={handleSearchClick} className="relative flex items-center bg-[#1e293b]/40 border border-slate-700/50 rounded-full p-2 pl-8 focus-within:border-yellow-400/50 transition-all shadow-inner backdrop-blur-sm">
-                <input 
-                  type="text" 
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Введите название товара..."
-                  className="flex-grow bg-transparent border-none py-4 text-white text-lg placeholder:text-slate-500 focus:outline-none"
-                />
-                <button type="submit" disabled={isSearching} className="bg-yellow-400 hover:bg-yellow-300 text-slate-950 font-black px-12 py-4 rounded-full transition-all active:scale-95 disabled:opacity-70 text-lg shadow-lg">
-                  {isSearching ? "Поиск..." : "Найти"}
+        <div className="max-w-4xl mx-auto relative z-10 text-center">
+          <h1 className="text-4xl md:text-6xl font-black mb-6 tracking-tight leading-tight">
+            Таможенный <span className="text-blue-400">Калькулятор</span>
+          </h1>
+          <p className="text-slate-400 text-lg mb-10 max-w-2xl mx-auto">
+            Мгновенный расчет пошлин и налогов по кодам ТН ВЭД. Введите название товара или код.
+          </p>
+          
+          <div className="relative max-w-2xl mx-auto group">
+            <div className="absolute -inset-1 bg-gradient-to-r from-blue-500 to-purple-600 rounded-2xl blur opacity-25 group-hover:opacity-50 transition duration-200"></div>
+            <div className="relative flex items-center bg-white rounded-xl shadow-xl overflow-hidden p-2">
+              <span className="pl-4 text-slate-400">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              </span>
+              <input 
+                type="text"
+                placeholder="Например: Смартфон, 8517, Кроссовки..."
+                className="w-full py-4 px-4 text-lg text-slate-900 placeholder-slate-400 outline-none font-medium"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              {searchQuery && (
+                <button 
+                  onClick={() => setSearchQuery('')}
+                  className="p-2 text-slate-300 hover:text-slate-500 transition-colors"
+                >
+                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
                 </button>
-              </form>
-              {showNoResultsHint && (
-                <div className="mt-4 animate-in slide-in-from-top-4 duration-300">
-                  <div className="bg-orange-500/10 border border-orange-500/20 rounded-3xl p-6 flex items-start gap-4 text-left backdrop-blur-sm">
-                    <div className="bg-orange-500 p-2 rounded-xl text-white shrink-0">
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                    </div>
-                    <div>
-                      <h4 className="font-black text-orange-500 text-sm uppercase tracking-wider mb-1">Ничего не найдено</h4>
-                      <p className="text-slate-300 text-sm leading-relaxed">
-                        Попробуйте поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('электроника'); triggerSearch('электроника');}}>электроника</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('инструмент'); triggerSearch('инструмент');}}>инструмент</span>.
-                      </p>
-                    </div>
-                  </div>
-                </div>
               )}
             </div>
           </div>
         </div>
       </div>
 
-      <div id="search-results-anchor" className="scroll-mt-10"></div>
-
-      {(isSearching || searchResults.length > 0) && (
-        <div className="max-w-7xl mx-auto px-4 mt-20">
-          <div className="flex items-center gap-4 mb-10">
-            <div className="w-2 h-10 rounded-full bg-emerald-500 shadow-[0_0_15px_rgba(16,185,129,0.4)]"></div>
-            <h2 className="text-3xl font-black text-slate-900 tracking-tight">
-              {searchResults.length > 0 ? 'Подходящие позиции' : 'Ничего не найдено'}
-            </h2>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 items-start">
+      {/* SEARCH RESULTS */}
+      {(hasSearched || isSearching) && (
+        <div className="max-w-4xl mx-auto px-4 -mt-10 relative z-20 mb-12">
+          <div className="bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden min-h-[100px]">
+            
             {isSearching ? (
-              [1, 2, 3, 4, 5, 6].map(i => <div key={i} className="h-[320px] bg-white rounded-[3rem] border border-slate-100 animate-pulse p-8 shadow-sm"></div>)
+              <div className="p-8 text-center text-slate-400">
+                <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-2"></div>
+                <p>Поиск по базе...</p>
+              </div>
+            ) : searchResults.length === 0 ? (
+              <div className="p-12 text-center">
+                <p className="text-slate-900 font-bold text-lg mb-2">Ничего не найдено</p>
+                <p className="text-slate-500">Попробуйте изменить запрос или использовать синонимы</p>
+              </div>
             ) : (
-              searchResults.map((item, idx) => (
-                <div key={`${item.code}-${idx}`} className={`group relative p-8 rounded-[3.5rem] border-2 transition-all hover:shadow-2xl flex flex-col h-full cursor-pointer ${selectedCode?.code === item.code ? 'border-emerald-400 bg-emerald-50/30' : 'border-white bg-white hover:border-slate-100'}`} onClick={() => setViewingProduct(item)}>
-                  <div className="relative z-10 flex flex-col h-full">
-                    <div className="flex justify-between items-start mb-6">
-                      <span className="text-[10px] font-black uppercase text-slate-400 bg-slate-100 px-3 py-1.5 rounded-full">{item.category}</span>
-                      <div className="font-mono text-sm text-emerald-600 font-black bg-emerald-500/10 px-3 py-1.5 rounded-xl tracking-tighter">{item.code}</div>
+              searchResults.map((item) => (
+                <div 
+                  key={item.code} 
+                  onClick={() => handleSelectCode(item)}
+                  className="group p-6 border-b border-slate-100 last:border-0 hover:bg-blue-50/50 cursor-pointer transition-colors flex flex-col md:flex-row gap-4 items-start md:items-center justify-between"
+                >
+                  <div className="flex-1">
+                    <div className="flex items-center gap-3 mb-1">
+                      <span className="font-mono text-sm font-bold text-blue-600 bg-blue-100 px-2 py-1 rounded">
+                        {item.code}
+                      </span>
+                      <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                        {CATEGORY_MAP[item.code.substring(0, 2)] || item.category || 'Товар'}
+                      </span>
                     </div>
-                    <h3 className="font-black text-slate-900 text-xl mb-3 leading-snug line-clamp-2 group-hover:text-blue-600 transition-colors">{item.name}</h3>
-                    <p className="text-slate-500 text-sm font-medium mb-8 leading-relaxed line-clamp-3">{item.description}</p>
-                    <div className="flex items-center gap-8 py-6 border-y border-slate-50 mt-auto mb-6">
-                      <div className="flex flex-col">
-                        <span className="text-[9px] font-black text-slate-400 uppercase">Пошлина</span>
-                        <span className="text-lg font-black text-slate-900">{item.importDuty}%</span>
-                      </div>
-                      <div className="flex flex-col">
-                        <span className="text-[9px] font-black text-slate-400 uppercase">НДС</span>
-                        <span className="text-lg font-black text-blue-600">{item.vat}%</span>
-                      </div>
+                    <h3 className="text-lg font-bold text-slate-800 group-hover:text-blue-700 transition-colors mb-1">
+                      {item.name}
+                    </h3>
+                    <p className="text-sm text-slate-500 line-clamp-2 leading-relaxed">
+                      {item.description}
+                    </p>
+                  </div>
+                  
+                  <div className="flex items-center gap-4 w-full md:w-auto mt-2 md:mt-0">
+                    <div className="flex flex-col items-end min-w-[80px]">
+                      <span className="text-xs text-slate-400 font-medium">Пошлина</span>
+                      <span className={`font-bold ${item.importDuty === 0 ? 'text-green-600' : 'text-slate-700'}`}>
+                        {item.importDuty}%
+                      </span>
                     </div>
-                    <div className="flex gap-2">
-                      <button onClick={(e) => { e.stopPropagation(); selectProduct(item); }} className="flex-grow py-5 bg-slate-900 hover:bg-slate-800 text-white font-black rounded-2xl transition-all active:scale-95 text-[10px] uppercase tracking-widest shadow-lg">В расчет</button>
-                      <button onClick={(e) => { e.stopPropagation(); setViewingProduct(item); }} className="p-5 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-2xl transition-all active:scale-90">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
-                      </button>
+                    <div className="flex flex-col items-end min-w-[60px]">
+                       <span className="text-xs text-slate-400 font-medium">НДС</span>
+                       <span className="font-bold text-slate-700">{item.vat}%</span>
+                    </div>
+                    <div className="hidden md:block pl-4 text-slate-300 group-hover:text-blue-400 group-hover:translate-x-1 transition-all">
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6"/></svg>
                     </div>
                   </div>
                 </div>
@@ -364,27 +274,35 @@ const App: React.FC = () => {
         </div>
       )}
 
-      <div id="calculator-section" className="max-w-7xl mx-auto px-4 mt-20 scroll-mt-24">
+      {/* CALCULATOR SECTION */}
+      <div id="calculator-section" className="max-w-7xl mx-auto px-4 mt-8 scroll-mt-24">
         {selectedCode && (
-          <div className="mb-10 flex justify-end">
-            <button onClick={scrollToSearch} className="bg-white border border-slate-200 text-slate-900 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-50 transition-all flex items-center gap-3">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m11 17-5-5 5-5"/><path d="M18 17l-5-5 5-5"/></svg>
-              Вернуться к поиску
-            </button>
+          <div className="mb-8 flex justify-end">
+            {/* Кнопка возврата видна только если мы прокрутили вниз */}
+            {showScrollToSearch && (
+              <button 
+                onClick={scrollToSearch} 
+                className="fixed bottom-8 right-8 z-50 bg-slate-900 text-white px-5 py-3 rounded-full font-bold text-sm shadow-2xl hover:bg-blue-600 transition-all flex items-center gap-2 animate-fade-in-up"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m18 15-6-6-6 6"/></svg>
+                Поиск
+              </button>
+            )}
           </div>
         )}
+        
         <Calculator 
           rates={rates}
           ratesUI={ratesUI}
           onRateChange={handleRateChange}
-          selectedCode={selectedCode} 
-          onCodeChange={(code) => {
-            const found = TNVED_DB.find(l => l.code === code);
-            if (found) setSelectedCode(found);
-            setTimeout(() => { document.getElementById('calculator-section')?.scrollIntoView({ behavior: 'smooth' }); }, 100);
-          }}
+          selectedCode={selectedCode}
         />
       </div>
+      
+      {/* FOOTER */}
+      <footer className="max-w-7xl mx-auto px-4 mt-20 text-center text-slate-400 text-sm pb-10">
+        <p>© 2024 TNVED Calc. Данные носят справочный характер.</p>
+      </footer>
     </div>
   );
 };
