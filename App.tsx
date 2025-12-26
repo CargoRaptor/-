@@ -39,18 +39,86 @@ const App: React.FC = () => {
   }
 
   // Индексация карты синонимов
-  const stemToPrefixes = useMemo(() => {
-    const map: Record<string, string[]> = {};
-    Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
-      terms.forEach(term => {
-        const s = term.toLowerCase().trim();
-        if (s.length < 2) return;
-        if (!map[s]) map[s] = [];
-        map[s].push(prefix);
+  const { stemToPrefixes, stemPrefixIndex } = useMemo(() => {
+    const stemToPrefixes = new Map<string, string[]>();
+    const stemPrefixIndex = new Map<string, string[]>();
+
+    Object.entries(SYNONYMS).forEach(([codePrefix, terms]) => {
+      terms.forEach((term) => {
+        const stem = getStem(term.toLowerCase().trim());
+        if (stem.length < 2) return;
+
+        const arr = stemToPrefixes.get(stem);
+        if (arr) arr.push(codePrefix);
+        else stemToPrefixes.set(stem, [codePrefix]);
       });
     });
-    return map;
+
+    // Tiny bucket index: first 3 chars of stem -> list of stems
+    for (const stem of stemToPrefixes.keys()) {
+      const key = stem.slice(0, 3);
+      if (key.length < 2) continue;
+
+      const bucket = stemPrefixIndex.get(key);
+      if (bucket) bucket.push(stem);
+      else stemPrefixIndex.set(key, [stem]);
+    }
+
+    return { stemToPrefixes, stemPrefixIndex };
   }, []);
+
+  type IndexedTNVED = TNVEDCode & {
+    _titleLower: string;
+    _descLower: string;
+    _titleStems: string[];
+    _code2: string;
+    _code4: string;
+  };
+
+  const searchIndex = useMemo(() => {
+    const items: IndexedTNVED[] = TNVED_DB.map((item) => {
+      const _titleLower = item.name.toLowerCase();
+      const _descLower = (item.description || '').toLowerCase();
+      const _titleStems = _titleLower
+        .split(/\s+/)
+        .map((w) => getStem(w))
+        .filter((s) => s.length >= 2);
+
+      return {
+        ...item,
+        _titleLower,
+        _descLower,
+        _titleStems,
+        _code2: item.code.slice(0, 2),
+        _code4: item.code.slice(0, 4),
+      };
+    });
+
+    const byPrefix2 = new Map<string, number[]>();
+    const byPrefix4 = new Map<string, number[]>();
+    const byStem = new Map<string, number[]>();
+
+    const pushIndex = (map: Map<string, number[]>, key: string, idx: number) => {
+      const arr = map.get(key);
+      if (arr) arr.push(idx);
+      else map.set(key, [idx]);
+    };
+
+    items.forEach((it, idx) => {
+      pushIndex(byPrefix2, it._code2, idx);
+      pushIndex(byPrefix4, it._code4, idx);
+
+      // Inverted index by title stems (unique per item to reduce noise)
+      const uniq = new Set(it._titleStems);
+      for (const s of uniq) {
+        if (s.length < 3) continue;
+        pushIndex(byStem, s, idx);
+      }
+    });
+
+    return { items, byPrefix2, byPrefix4, byStem };
+  }, []);
+
 
   useEffect(() => {
     const handleScroll = () => {
@@ -95,81 +163,139 @@ const App: React.FC = () => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
-    if (queryWords.length === 0) return [];
-    
-    const queryStems = queryWords.map(w => getStem(w));
+    const queryWords = trimmed
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
 
-    // 1. Собираем подходящие префиксы кодов из карты SYNONYMS
+    if (queryWords.length === 0) return [];
+
+    const queryStems = queryWords.map((w) => getStem(w)).filter((s) => s.length >= 2);
+    if (queryStems.length === 0) return [];
+
+    // 1) Collect candidate code prefixes (fast: direct stem hit first; then small-bucket fuzzy)
     const codePrefixWeights = new Map<string, number>();
+    const addPrefixWeight = (prefix: string, weight: number) => {
+      codePrefixWeights.set(prefix, (codePrefixWeights.get(prefix) || 0) + weight);
+    };
+
     queryStems.forEach((qStem, qIdx) => {
       const importance = qIdx === 0 ? 2.5 : 1.0;
-      
-      Object.keys(stemToPrefixes).forEach(mapStem => {
-        // Если корень из запроса совпал с корнем из карты (или один входит в другой)
+
+      const direct = stemToPrefixes.get(qStem);
+      if (direct && direct.length) {
+        for (const prefix of direct) addPrefixWeight(prefix, 2000 * importance * 1.2);
+        return;
+      }
+
+      const bucketKey = qStem.slice(0, 3);
+      const bucket = stemPrefixIndex.get(bucketKey) || [];
+      for (const mapStem of bucket) {
         if (qStem.includes(mapStem) || mapStem.includes(qStem)) {
-          stemToPrefixes[mapStem].forEach(prefix => {
-            const current = codePrefixWeights.get(prefix) || 0;
-            // Качественное совпадение дает больше веса
-            const matchQuality = mapStem === qStem ? 1.2 : 0.8;
-            codePrefixWeights.set(prefix, current + (2000 * importance * matchQuality));
-          });
+          const prefixes = stemToPrefixes.get(mapStem);
+          if (!prefixes) continue;
+
+          const matchQuality = mapStem === qStem ? 1.2 : 0.8;
+          for (const prefix of prefixes) addPrefixWeight(prefix, 2000 * importance * matchQuality);
         }
-      });
+      }
     });
 
-    // 2. Оцениваем каждый товар в базе
-    const scoredResults = TNVED_DB.map(item => {
+    // 2) Build candidate list (avoid scanning the whole DB when we have a prefix signal)
+    const candidates = new Set<number>();
+
+    const addCandidatesFromPrefix = (prefix: string) => {
+      if (prefix.length === 2) {
+        const arr = searchIndex.byPrefix2.get(prefix);
+        if (arr) arr.forEach((i) => candidates.add(i));
+        return;
+      }
+      if (prefix.length === 4) {
+        const arr = searchIndex.byPrefix4.get(prefix);
+        if (arr) arr.forEach((i) => candidates.add(i));
+        return;
+      }
+      // Fallback for unexpected prefix length
+      const p4 = prefix.slice(0, 4);
+      if (p4.length === 4) {
+        const arr = searchIndex.byPrefix4.get(p4);
+        if (arr) arr.forEach((i) => candidates.add(i));
+      }
+    };
+
+    if (codePrefixWeights.size > 0) {
+      for (const prefix of codePrefixWeights.keys()) addCandidatesFromPrefix(prefix);
+    } else {
+      // Fallback to inverted index by stems
+      for (const s of queryStems) {
+        const arr = searchIndex.byStem.get(s);
+        if (arr) arr.forEach((i) => candidates.add(i));
+      }
+
+      // If still empty, do a limited scan fallback
+      if (candidates.size === 0) {
+        for (let i = 0; i < searchIndex.items.length && i < 3000; i++) candidates.add(i);
+      }
+    }
+
+    // 3) Score only candidates
+    const results: { item: TNVEDCode; score: number; isRelevant: boolean }[] = [];
+    const prefixesArray = Array.from(codePrefixWeights.entries());
+
+    for (const idx of candidates) {
+      const item = searchIndex.items[idx];
       let score = 0;
       let subjectConfirmed = false;
       let matchedStemsCount = 0;
 
-      const title = item.name.toLowerCase();
-      const titleStems = title.split(/\s+/).map(w => getStem(w));
-      const description = item.description.toLowerCase();
-
-      // А) Проверка по карте (префиксы)
-      codePrefixWeights.forEach((weight, prefix) => {
-        if (item.code.startsWith(prefix)) {
-          score += weight;
-          subjectConfirmed = true; 
+      // A) Prefix signal (fast)
+      if (prefixesArray.length) {
+        for (const [prefix, weight] of prefixesArray) {
+          if (prefix.length === 2 && item._code2 === prefix) {
+            score += weight;
+            subjectConfirmed = true;
+          } else if (prefix.length === 4 && item._code4 === prefix) {
+            score += weight;
+            subjectConfirmed = true;
+          } else if (prefix.length !== 2 && prefix.length !== 4 && item.code.startsWith(prefix)) {
+            score += weight;
+            subjectConfirmed = true;
+          }
         }
-      });
+      }
 
-      // Б) Прямой поиск в названии и описании
-      queryStems.forEach((qStem, qIdx) => {
-        let wordFound = false;
+      // B) Text match
+      for (let qIdx = 0; qIdx < queryStems.length; qIdx++) {
+        const qStem = queryStems[qIdx];
         const isPrimary = qIdx === 0;
 
-        // Если корень слова из поиска есть в названии
-        if (titleStems.some(ts => ts.includes(qStem) || qStem.includes(ts))) {
+        let wordFound = false;
+
+        if (item._titleStems.some((ts) => ts.includes(qStem) || qStem.includes(ts))) {
           score += isPrimary ? 4000 : 1500;
           wordFound = true;
           subjectConfirmed = true;
         }
 
-        // Если корень слова из поиска есть в описании (минимальный вес)
-        if (description.includes(qStem)) {
+        if (!wordFound && item._descLower.includes(qStem)) {
           score += 100;
           wordFound = true;
         }
 
         if (wordFound) matchedStemsCount++;
-      });
+      }
 
-      // Релевантность: субъект должен быть подтвержден (картой или названием)
       const matchDensity = matchedStemsCount / queryStems.length;
       const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 800 : matchDensity >= 0.4);
 
-      return { item, score, isRelevant };
-    });
+      if (isRelevant) results.push({ item, score, isRelevant });
+    }
 
-    return scoredResults
-      .filter(res => res.isRelevant)
+    return results
       .sort((a, b) => b.score - a.score)
-      .map(res => res.item)
+      .map((r) => r.item)
       .slice(0, 30);
-  };
+  };;
 
   const triggerSearch = (query: string) => {
     setIsSearching(true);
