@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
@@ -21,18 +22,21 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
-  const [termToPrefixes, setTermToPrefixes] = useState<Record<string, string[]>>({});
+  const [termToPrefixData, setTermToPrefixData] = useState<Record<string, {prefix: string, isSpecific: boolean}[]>>({});
 
   useEffect(() => {
-    const map: Record<string, string[]> = {};
+    const map: Record<string, {prefix: string, isSpecific: boolean}[]> = {};
     Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
       terms.forEach(term => {
         const stem = getStem(term);
         if (!map[stem]) map[stem] = [];
-        if (!map[stem].includes(prefix)) map[stem].push(prefix);
+        map[stem].push({
+          prefix,
+          isSpecific: prefix.length >= 4 // Коды от 4 цифр считаются специфичными
+        });
       });
     });
-    setTermToPrefixes(map);
+    setTermToPrefixData(map);
   }, []);
 
   useEffect(() => {
@@ -91,21 +95,14 @@ const App: React.FC = () => {
 
     const queryStems = queryWords.map(w => getStem(w));
     
-    const matchedPrefixes = new Set<string>();
+    // Сбор подходящих префиксов из словаря синонимов
+    const matchedPrefixes = new Map<string, boolean>(); // prefix -> isSpecific
     queryStems.forEach(stem => {
-      Object.keys(termToPrefixes).forEach(termStem => {
+      Object.keys(termToPrefixData).forEach(termStem => {
         if (termStem.startsWith(stem) || stem.startsWith(termStem)) {
-          termToPrefixes[termStem].forEach(p => matchedPrefixes.add(p));
-        }
-      });
-    });
-
-    const matchedCategoryPrefixes = new Set<string>();
-    queryStems.forEach(stem => {
-      Object.entries(CATEGORY_MAP).forEach(([prefix, name]) => {
-        const catNameStems = name.toLowerCase().split(/[\s/]+/).map(w => getStem(w));
-        if (catNameStems.some(cs => cs.startsWith(stem) || stem.startsWith(cs))) {
-          matchedCategoryPrefixes.add(prefix);
+          termToPrefixData[termStem].forEach(data => {
+            matchedPrefixes.set(data.prefix, data.isSpecific || (matchedPrefixes.get(data.prefix) || false));
+          });
         }
       });
     });
@@ -113,65 +110,73 @@ const App: React.FC = () => {
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
       let hasHardMatch = false;
+      let matchSource = "";
 
-      const nameTokens = item.name.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const nameLower = item.name.toLowerCase();
+      const nameTokens = nameLower.split(/\s+/).map(w => getStem(w));
       const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
       const descTokens = item.description.toLowerCase().split(/\s+/).map(w => getStem(w));
 
-      // 1. Поиск через словарь СИНОНИМОВ (Максимальный приоритет)
-      matchedPrefixes.forEach(prefix => {
+      // 1. Поиск через словарь СИНОНИМОВ
+      matchedPrefixes.forEach((isSpecific, prefix) => {
         if (item.code.startsWith(prefix)) {
-          score += 100;
-          hasHardMatch = true;
+          // Если префикс короткий (2 цифры), требуем подтверждения в названии товара
+          // чтобы при поиске "штаны" не вылезали "перчатки" только из-за того, что они в одной главе
+          const matchesInName = queryStems.some(qs => nameTokens.some(nt => nt.startsWith(qs) || qs.startsWith(nt)));
+          
+          if (isSpecific || matchesInName) {
+            score += isSpecific ? 120 : 80;
+            hasHardMatch = true;
+            matchSource = "Синонимы";
+          }
         }
       });
 
-      // 2. Поиск через CATEGORY_MAP (Высокий приоритет)
-      matchedCategoryPrefixes.forEach(prefix => {
-        if (item.code.startsWith(prefix)) {
-          score += 50;
-          hasHardMatch = true;
-        }
-      });
-
-      // 3. Текстовый поиск по полям
+      // 2. Текстовый поиск по названию (Высокий приоритет)
       queryStems.forEach(term => {
-        // Название: +40 за точное совпадение корня, +20 за начало
         if (nameTokens.some(nt => nt === term)) {
+          score += 60;
+          hasHardMatch = true;
+        } else if (nameTokens.some(nt => nt.startsWith(term) || term.startsWith(nt))) {
           score += 40;
           hasHardMatch = true;
-        } else if (nameTokens.some(nt => nt.startsWith(term))) {
-          score += 20;
-          hasHardMatch = true;
         }
-        
-        // Категория: +20 за совпадение
+      });
+
+      // 3. Поиск по категории (Средний приоритет)
+      queryStems.forEach(term => {
         if (catTokens.some(ct => ct === term || ct.startsWith(term))) {
-          score += 20;
-          hasHardMatch = true;
+          score += 30;
+          // Категория дает HardMatch только если это не единственный источник или если запрос короткий
+          if (queryStems.length === 1) hasHardMatch = true;
         }
+      });
 
-        // Описание: +5 (только если есть другие совпадения или это специфический термин)
+      // 4. Поиск по описанию (Низкий приоритет, только для веса)
+      queryStems.forEach(term => {
         if (descTokens.some(dt => dt === term || dt.startsWith(term))) {
-          score += 5;
+          score += 10;
         }
       });
 
-      // Бонус за совпадение нескольких слов из запроса
-      let wordsMatched = 0;
-      queryStems.forEach(qs => {
-        // Fix: corrected typo where 'nt' was incorrectly used instead of 'ct' in catTokens.some callback
-        if (nameTokens.some(nt => nt.startsWith(qs)) || catTokens.some(ct => ct.startsWith(qs))) {
-          wordsMatched++;
-        }
-      });
-      if (wordsMatched > 1) {
-        score += (wordsMatched * 30);
+      // Штраф за несовпадение корней (если в названии нет ни одного слова из запроса)
+      const anyNameMatch = queryStems.some(qs => nameTokens.some(nt => nt.startsWith(qs) || qs.startsWith(nt)));
+      if (!anyNameMatch && !hasHardMatch) {
+        score -= 50;
       }
 
-      // Товар считается релевантным только если есть Hard Match (в имени, категории или через синоним)
-      // Либо если это очень точное попадание в описание (высокий score)
-      const isRelevant = hasHardMatch || score > 60;
+      // Бонус за полноту совпадения
+      const matchedWordsCount = queryStems.filter(qs => 
+        nameTokens.some(nt => nt.startsWith(qs)) || 
+        catTokens.some(ct => ct.startsWith(qs))
+      ).length;
+      
+      if (matchedWordsCount === queryStems.length && queryStems.length > 1) {
+        score += 50;
+      }
+
+      // Окончательный фильтр: должен быть "жесткий" контакт или очень высокий балл
+      const isRelevant = hasHardMatch && score > 40;
 
       return { item, score, relevance: isRelevant };
     });
