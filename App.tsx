@@ -28,16 +28,17 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
-  // Улучшенный стеммер: очищаем слово для поиска
+  // Мощный стеммер для русского языка
   function getStem(word: string): string {
     return word
       .toLowerCase()
       .trim()
       .replace(/[.,!?;:]/g, '')
+      // Убираем окончания и суффиксы для получения чистого корня
       .replace(/(иями|ями|иям|ям|иях|ях|овая|овое|овый|очные|очный|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
   }
 
-  // Индексация синонимов (Search Maps)
+  // Индексация карты синонимов
   const stemToPrefixes = useMemo(() => {
     const map: Record<string, string[]> = {};
     Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
@@ -99,24 +100,25 @@ const App: React.FC = () => {
     
     const queryStems = queryWords.map(w => getStem(w));
 
-    // 1. Поиск кодов в SYNONYMS (Карта поиска)
+    // 1. Собираем подходящие префиксы кодов из карты SYNONYMS
     const codePrefixWeights = new Map<string, number>();
     queryStems.forEach((qStem, qIdx) => {
-      const importance = qIdx === 0 ? 2.0 : 1.0;
+      const importance = qIdx === 0 ? 2.5 : 1.0;
       
       Object.keys(stemToPrefixes).forEach(mapStem => {
-        // Двустороннее сравнение: корень из карты есть в запросе ИЛИ запрос начинается с корня из карты
+        // Если корень из запроса совпал с корнем из карты (или один входит в другой)
         if (qStem.includes(mapStem) || mapStem.includes(qStem)) {
           stemToPrefixes[mapStem].forEach(prefix => {
             const current = codePrefixWeights.get(prefix) || 0;
-            const matchQuality = mapStem === qStem ? 1 : 0.8;
-            codePrefixWeights.set(prefix, current + (1000 * importance * matchQuality));
+            // Качественное совпадение дает больше веса
+            const matchQuality = mapStem === qStem ? 1.2 : 0.8;
+            codePrefixWeights.set(prefix, current + (2000 * importance * matchQuality));
           });
         }
       });
     });
 
-    // 2. Скоринг товаров из TNVED_DB
+    // 2. Оцениваем каждый товар в базе
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
       let subjectConfirmed = false;
@@ -126,37 +128,38 @@ const App: React.FC = () => {
       const titleStems = title.split(/\s+/).map(w => getStem(w));
       const description = item.description.toLowerCase();
 
-      // А) Вес из карты синонимов (Самый надежный способ подтверждения)
+      // А) Проверка по карте (префиксы)
       codePrefixWeights.forEach((weight, prefix) => {
         if (item.code.startsWith(prefix)) {
           score += weight;
-          subjectConfirmed = true; // Если код совпал с синонимами из карты - товар точно "тот самый"
+          subjectConfirmed = true; 
         }
       });
 
-      // Б) Вес из заголовка
+      // Б) Прямой поиск в названии и описании
       queryStems.forEach((qStem, qIdx) => {
         let wordFound = false;
         const isPrimary = qIdx === 0;
 
+        // Если корень слова из поиска есть в названии
         if (titleStems.some(ts => ts.includes(qStem) || qStem.includes(ts))) {
-          score += isPrimary ? 3000 : 1200;
+          score += isPrimary ? 4000 : 1500;
           wordFound = true;
           subjectConfirmed = true;
         }
 
+        // Если корень слова из поиска есть в описании (минимальный вес)
         if (description.includes(qStem)) {
-          score += 100; // Описанию даем мало веса
+          score += 100;
           wordFound = true;
         }
 
         if (wordFound) matchedStemsCount++;
       });
 
-      // Фильтрация
+      // Релевантность: субъект должен быть подтвержден (картой или названием)
       const matchDensity = matchedStemsCount / queryStems.length;
-      // Релевантно, если предмет подтвержден И (одно слово совпало на 100% ИЛИ длинный запрос совпал на 40%)
-      const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 500 : matchDensity >= 0.4);
+      const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 800 : matchDensity >= 0.4);
 
       return { item, score, isRelevant };
     });
@@ -276,7 +279,7 @@ const App: React.FC = () => {
                   type="text" 
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Введите название товара..."
+                  placeholder="Например: куртка женская или говядина..."
                   className="flex-grow bg-transparent border-none py-4 text-white text-lg placeholder:text-slate-500 focus:outline-none"
                 />
                 <button type="submit" disabled={isSearching} className="bg-yellow-400 hover:bg-yellow-300 text-slate-950 font-black px-12 py-4 rounded-full transition-all active:scale-95 disabled:opacity-70 text-lg shadow-lg">
@@ -292,7 +295,7 @@ const App: React.FC = () => {
                     <div>
                       <h4 className="font-black text-orange-500 text-sm uppercase tracking-wider mb-1">Ничего не найдено</h4>
                       <p className="text-slate-300 text-sm leading-relaxed">
-                        Попробуйте поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('электроника'); triggerSearch('электроника');}}>электроника</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('инструмент'); triggerSearch('инструмент');}}>инструмент</span>.
+                        Попробуйте поискать по более общей категории, например: <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('одежда'); triggerSearch('одежда');}}>одежда</span>, <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('мясо'); triggerSearch('мясо');}}>мясо</span> или <span className="text-white font-bold underline cursor-pointer hover:text-yellow-400 transition-colors" onClick={() => {setSearchQuery('смартфон'); triggerSearch('смартфон');}}>смартфон</span>.
                       </p>
                     </div>
                   </div>
@@ -310,7 +313,7 @@ const App: React.FC = () => {
           <div className="flex items-center gap-4 mb-10">
             <div className="w-2 h-10 rounded-full bg-emerald-500 shadow-[0_0_15px_rgba(16,185,129,0.4)]"></div>
             <h2 className="text-3xl font-black text-slate-900 tracking-tight">
-              {searchResults.length > 0 ? 'Подходящие позиции' : 'Ничего не найдено'}
+              {searchResults.length > 0 ? 'Результаты поиска' : 'Поиск...'}
             </h2>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 items-start">
