@@ -11,19 +11,23 @@ interface CalculatorProps {
   onRateChange: (key: 'USD' | 'CNY' | 'EUR', value: string) => void;
 }
 
+const SEA_DISCOUNT_FROM_RAIL = 0.95;
+
 const DENSITY_COEFFICIENTS: Record<ShippingMethod, number> = {
   Air: 167,
   Road: 250,
   Rail: 300,
-  Sea: 1000
+  // Чтобы море всегда было дешевле ЖД на 5%, используем тот же коэффициент объёмного веса, что и у ЖД.
+  // (Если коэффициенты разные, при объёмном грузе море может стать дороже из‑за большего chargeableWeight.)
+  Sea: 300
 };
 
 const SHIPPING_TIERS: Record<ShippingMethod, { min: number; rate: number }[]> = {
   Air: [{ min: 1000, rate: 4.2 }, { min: 300, rate: 4.8 }, { min: 100, rate: 5.5 }, { min: 50, rate: 6.5 }, { min: 0, rate: 8.0 }],
   Road: [{ min: 1000, rate: 2.5 }, { min: 300, rate: 3.0 }, { min: 100, rate: 3.5 }, { min: 50, rate: 4.5 }, { min: 0, rate: 5.5 }],
   Rail: [{ min: 1000, rate: 1.5 }, { min: 300, rate: 2.0 }, { min: 100, rate: 2.5 }, { min: 50, rate: 3.0 }, { min: 0, rate: 4.0 }],
-  // Sea rates are exactly 5% cheaper than Rail (Rate * 0.95)
-  Sea: [{ min: 1000, rate: 1.425 }, { min: 300, rate: 1.9 }, { min: 100, rate: 2.375 }, { min: 50, rate: 2.85 }, { min: 0, rate: 3.8 }]
+  // Море — ровно на 5% дешевле ЖД по ставке
+  Sea: [{ min: 1000, rate: 1.5 * SEA_DISCOUNT_FROM_RAIL }, { min: 300, rate: 2.0 * SEA_DISCOUNT_FROM_RAIL }, { min: 100, rate: 2.5 * SEA_DISCOUNT_FROM_RAIL }, { min: 50, rate: 3.0 * SEA_DISCOUNT_FROM_RAIL }, { min: 0, rate: 4.0 * SEA_DISCOUNT_FROM_RAIL }]
 };
 
 const SHIPPING_LABELS: Record<ShippingMethod, string> = { Sea: 'Море', Rail: 'Ж/Д', Road: 'Авто', Air: 'Авиа' };
@@ -125,10 +129,25 @@ export const Calculator: React.FC<CalculatorProps> = ({
     const tier = SHIPPING_TIERS[selectedShippingMethod].find(t => chargeableWeight >= t.min);
     const ratePerKg = tier ? tier.rate : 1;
     
-    // Base fee is also 5% cheaper for Sea ($150 * 0.95 = $142.5)
-    const baseShippingFeeUSD = selectedShippingMethod === 'Sea' ? 142.5 : 150;
-    const totalShippingUSD = (countableWeight => (countableWeight * ratePerKg) + baseShippingFeeUSD)(chargeableWeight);
-    const totalShippingRUB = totalShippingUSD * rates.USD;
+    // Правило: море всегда на 5% дешевле ЖД.
+// Реализуем через расчёт ЖД и скидку 5% (так исключаем ситуации, когда море становится дороже из-за объёмного веса/ступеней).
+const BASE_SHIPPING_FEE_USD = 150;
+let totalShippingUSD: number;
+
+if (selectedShippingMethod === 'Sea') {
+  const railK = DENSITY_COEFFICIENTS.Rail;
+  const railVolWeight = volume * railK;
+  const railChargeableWeight = Math.max(weight, railVolWeight);
+  const railTier = SHIPPING_TIERS.Rail.find(t => railChargeableWeight >= t.min);
+  const railRatePerKg = railTier ? railTier.rate : 1;
+  const railShippingUSD = (railChargeableWeight * railRatePerKg) + BASE_SHIPPING_FEE_USD;
+
+  totalShippingUSD = railShippingUSD * SEA_DISCOUNT_FROM_RAIL;
+} else {
+  totalShippingUSD = (chargeableWeight * ratePerKg) + BASE_SHIPPING_FEE_USD;
+}
+
+const totalShippingRUB = totalShippingUSD * rates.USD;
 
     const localServicesRUB = 20000 + 35000;
     const grandTotalRUB = customsValueRUB + totalTaxesRUB + bankCommissionRUB + totalShippingRUB + localServicesRUB;
