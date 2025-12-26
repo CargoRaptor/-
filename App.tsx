@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
@@ -22,7 +21,6 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
-  // Инвертированный словарь синонимов для быстрого поиска префиксов по слову
   const [termToPrefixes, setTermToPrefixes] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
@@ -37,7 +35,6 @@ const App: React.FC = () => {
     setTermToPrefixes(map);
   }, []);
 
-  // Отслеживание скролла для показа кнопки "К поиску"
   useEffect(() => {
     const handleScroll = () => {
       const searchSection = document.getElementById('search-area');
@@ -50,7 +47,6 @@ const App: React.FC = () => {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  // Закрытие попапа по ESC
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setViewingProduct(null);
@@ -95,7 +91,6 @@ const App: React.FC = () => {
 
     const queryStems = queryWords.map(w => getStem(w));
     
-    // Поиск префиксов кодов через словарь синонимов
     const matchedPrefixes = new Set<string>();
     queryStems.forEach(stem => {
       Object.keys(termToPrefixes).forEach(termStem => {
@@ -105,7 +100,6 @@ const App: React.FC = () => {
       });
     });
 
-    // Поиск совпадений в CATEGORY_MAP
     const matchedCategoryPrefixes = new Set<string>();
     queryStems.forEach(stem => {
       Object.entries(CATEGORY_MAP).forEach(([prefix, name]) => {
@@ -118,56 +112,68 @@ const App: React.FC = () => {
 
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
-      let matchedAny = false;
+      let hasHardMatch = false;
 
       const nameTokens = item.name.toLowerCase().split(/\s+/).map(w => getStem(w));
       const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
       const descTokens = item.description.toLowerCase().split(/\s+/).map(w => getStem(w));
 
-      // 1. Прямой текстовый поиск
-      queryStems.forEach(term => {
-        if (nameTokens.some(nt => nt === term)) {
-          score += 20; matchedAny = true;
-        } else if (nameTokens.some(nt => nt.startsWith(term))) {
-          score += 10; matchedAny = true;
-        }
-        
-        if (catTokens.some(ct => ct === term)) {
-          score += 12; matchedAny = true;
-        } else if (catTokens.some(ct => ct.startsWith(term))) {
-          score += 6; matchedAny = true;
-        }
-
-        if (descTokens.some(dt => dt === term)) {
-          score += 4; matchedAny = true;
-        }
-      });
-
-      // 2. Поиск через словарь СИНОНИМОВ (самый сильный буст)
+      // 1. Поиск через словарь СИНОНИМОВ (Максимальный приоритет)
       matchedPrefixes.forEach(prefix => {
         if (item.code.startsWith(prefix)) {
-          score += 50;
-          matchedAny = true;
+          score += 100;
+          hasHardMatch = true;
         }
       });
 
-      // 3. Поиск через CATEGORY_MAP
+      // 2. Поиск через CATEGORY_MAP (Высокий приоритет)
       matchedCategoryPrefixes.forEach(prefix => {
         if (item.code.startsWith(prefix)) {
-          score += 30;
-          matchedAny = true;
+          score += 50;
+          hasHardMatch = true;
         }
       });
 
-      // 4. Бонус за совпадение всех слов запроса
-      const allWordsFound = queryStems.every(qs => 
-        nameTokens.some(nt => nt.startsWith(qs)) || 
-        catTokens.some(ct => ct.startsWith(qs)) || 
-        descTokens.some(dt => dt.startsWith(qs))
-      );
-      if (allWordsFound && queryStems.length > 1) score += 40;
+      // 3. Текстовый поиск по полям
+      queryStems.forEach(term => {
+        // Название: +40 за точное совпадение корня, +20 за начало
+        if (nameTokens.some(nt => nt === term)) {
+          score += 40;
+          hasHardMatch = true;
+        } else if (nameTokens.some(nt => nt.startsWith(term))) {
+          score += 20;
+          hasHardMatch = true;
+        }
+        
+        // Категория: +20 за совпадение
+        if (catTokens.some(ct => ct === term || ct.startsWith(term))) {
+          score += 20;
+          hasHardMatch = true;
+        }
 
-      return { item, score, relevance: matchedAny && score >= 10 };
+        // Описание: +5 (только если есть другие совпадения или это специфический термин)
+        if (descTokens.some(dt => dt === term || dt.startsWith(term))) {
+          score += 5;
+        }
+      });
+
+      // Бонус за совпадение нескольких слов из запроса
+      let wordsMatched = 0;
+      queryStems.forEach(qs => {
+        // Fix: corrected typo where 'nt' was incorrectly used instead of 'ct' in catTokens.some callback
+        if (nameTokens.some(nt => nt.startsWith(qs)) || catTokens.some(ct => ct.startsWith(qs))) {
+          wordsMatched++;
+        }
+      });
+      if (wordsMatched > 1) {
+        score += (wordsMatched * 30);
+      }
+
+      // Товар считается релевантным только если есть Hard Match (в имени, категории или через синоним)
+      // Либо если это очень точное попадание в описание (высокий score)
+      const isRelevant = hasHardMatch || score > 60;
+
+      return { item, score, relevance: isRelevant };
     });
 
     return scoredResults
