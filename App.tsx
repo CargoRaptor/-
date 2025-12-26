@@ -7,6 +7,9 @@ import { CATEGORY_MAP, SYNONYMS } from './data/search_maps';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
+// Список "стоп-слов", которые не должны влиять на поиск как основной критерий
+const STOP_WORDS = new Set(['для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой']);
+
 const App: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCode, setSelectedCode] = useState<TNVEDCode | null>(POPULAR_LIBRARY[0]);
@@ -83,6 +86,7 @@ const App: React.FC = () => {
       .toLowerCase()
       .trim()
       .replace(/[.,!?;:]/g, '')
+      // Более строгая очистка окончаний для русского языка
       .replace(/(иями|ями|иям|ям|иях|ях|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
   };
 
@@ -90,18 +94,29 @@ const App: React.FC = () => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2);
+    // Фильтруем стоп-слова и короткие мусорные части
+    const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
     if (queryWords.length === 0) return [];
 
     const queryStems = queryWords.map(w => getStem(w));
     
-    // Поиск префиксов через синонимы
-    const matchedPrefixes = new Map<string, {isSpecific: boolean, matchedStem: string}>();
+    // 1. Предварительный поиск префиксов через словарь синонимов
+    const matchedPrefixData = new Map<string, {isSpecific: boolean, weight: number, matchedStem: string}>();
     queryStems.forEach(stem => {
       Object.keys(termToPrefixData).forEach(termStem => {
-        if (termStem.startsWith(stem) || stem.startsWith(termStem)) {
+        // Требуем либо точного совпадения корней, либо вложенности для длинных слов
+        const isMatch = termStem === stem || (stem.length > 4 && termStem.startsWith(stem)) || (termStem.length > 4 && stem.startsWith(termStem));
+        if (isMatch) {
           termToPrefixData[termStem].forEach(data => {
-            matchedPrefixes.set(data.prefix, { isSpecific: data.isSpecific, matchedStem: stem });
+            const current = matchedPrefixData.get(data.prefix);
+            const matchWeight = termStem === stem ? 100 : 50;
+            if (!current || matchWeight > current.weight) {
+              matchedPrefixData.set(data.prefix, { 
+                isSpecific: data.isSpecific, 
+                weight: matchWeight,
+                matchedStem: stem 
+              });
+            }
           });
         }
       });
@@ -109,54 +124,56 @@ const App: React.FC = () => {
 
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
-      let matchedStemsInItem = new Set<string>();
+      let matchedInNameCount = 0;
+      let matchedInSynonymsCount = 0;
 
       const nameTokens = item.name.toLowerCase().split(/\s+/).map(w => getStem(w));
       const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
-      const descTokens = item.description.toLowerCase().split(/\s+/).map(w => getStem(w));
-
-      // 1. Совпадение по синонимам
-      matchedPrefixes.forEach((data, prefix) => {
+      
+      // А) Проверка по найденным через синонимы префиксам
+      matchedPrefixData.forEach((data, prefix) => {
         if (item.code.startsWith(prefix)) {
-          score += data.isSpecific ? 150 : 70;
-          matchedStemsInItem.add(data.matchedStem);
+          score += data.isSpecific ? 200 : 100;
+          matchedInSynonymsCount++;
         }
       });
 
-      // 2. Прямое текстовое совпадение
+      // Б) Прямое совпадение слов запроса в Названии и Категории
       queryStems.forEach(stem => {
-        let matched = false;
-        if (nameTokens.some(nt => nt.includes(stem) || stem.includes(nt))) {
-          score += 100;
-          matched = true;
+        // Точное совпадение корня в названии — самый высокий приоритет
+        if (nameTokens.includes(stem)) {
+          score += 300;
+          matchedInNameCount++;
+        } else if (nameTokens.some(nt => nt.startsWith(stem) || stem.startsWith(nt))) {
+          // Частичное совпадение корня
+          score += 150;
+          matchedInNameCount++;
         }
-        if (catTokens.some(ct => ct.includes(stem) || stem.includes(ct))) {
-          score += 40;
-          matched = true;
+
+        // Совпадение в категории — средний приоритет
+        if (catTokens.includes(stem)) {
+          score += 50;
         }
-        if (descTokens.some(dt => dt.includes(stem) || stem.includes(dt))) {
-          score += 10;
-          matched = true;
-        }
-        if (matched) matchedStemsInItem.add(stem);
       });
 
-      // 3. ФИЛЬТР: Если запрос многословный, а в товаре совпал только 1 корень (например "спортивные")
-      // И при этом это не совпадение по конкретному длинному коду, то это "мусор"
-      if (queryStems.length >= 2 && matchedStemsInItem.size < 2) {
-        // Проверяем, не является ли это супер-точным совпадением по коду
-        const isVerySpecificCodeMatch = Array.from(matchedPrefixes.entries()).some(([p, d]) => item.code.startsWith(p) && p.length >= 4);
-        if (!isVerySpecificCodeMatch) {
-          score -= 200; // Резко снижаем релевантность "лыж" при поиске "спортивных бутылок"
-        }
+      // В) КРИТИЧЕСКИЙ ФИЛЬТР: Защита от "туш говяжьих" при поиске "бутылок"
+      // Если в названии товара нет НИ ОДНОГО совпадения корня из запроса, 
+      // и это не подтверждено синонимами, обнуляем результат.
+      const hasDirectMatch = matchedInNameCount > 0 || matchedInSynonymsCount > 0;
+      
+      // Если запрос многословный (напр. "спортивная бутылка"), 
+      // требуем хотя бы 2 совпадения или 1 очень сильное в названии.
+      const isLowQualityMatch = queryStems.length >= 2 && matchedInNameCount < 1 && matchedInSynonymsCount < 1;
+
+      // Штраф за отсутствие "кучности" слов
+      if (queryStems.length > 1) {
+        score += (matchedInNameCount * 100); 
       }
 
-      // Бонус за полноту совпадения запроса
-      if (matchedStemsInItem.size === queryStems.length) {
-        score += 100;
-      }
+      // Г) Оценка релевантности
+      const isRelevant = hasDirectMatch && !isLowQualityMatch && score > 80;
 
-      return { item, score, relevance: score > 50 };
+      return { item, score, relevance: isRelevant };
     });
 
     return scoredResults
