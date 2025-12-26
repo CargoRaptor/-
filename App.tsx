@@ -68,8 +68,8 @@ const tnvedIndex = useMemo(() => {
   };
 
   TNVED_DB.forEach((item, idx) => {
-    const titleLower = item.name.toLowerCase();
-    const descLower = item.description.toLowerCase();
+    const titleLower = (item.name || '').toLowerCase();
+    const descLower = (item.description || '').toLowerCase();
 
     const titleStems = tokenize(titleLower)
       .filter(w => w.length >= 2 && !STOP_WORDS.has(w))
@@ -84,14 +84,14 @@ const tnvedIndex = useMemo(() => {
     uniq.forEach(st => push(stemIndex, st, idx));
 
     // prefix indexes
-    const c = item.code;
+    const c = String((item as any).code ?? '');
     if (c.length >= 2) push(prefix2, c.slice(0, 2), idx);
     if (c.length >= 4) push(prefix4, c.slice(0, 4), idx);
     if (c.length >= 6) push(prefix6, c.slice(0, 6), idx);
   });
 
   return { records, stemIndex, prefix2, prefix4, prefix6 };
-}, []);
+}, [TNVED_DB]);
 
 // Индексация карты SYNONYMS: теперь сопоставляем “стем -> префиксы”, а не перебираем все ключи каждый раз
 const synonymIndex = useMemo(() => {
@@ -127,7 +127,7 @@ const synonymIndex = useMemo(() => {
   });
 
   return { stemToPrefixes, bucket3 };
-}, []);
+}, [SYNONYMS]);
 
   useEffect(() => {
     const handleScroll = () => {
