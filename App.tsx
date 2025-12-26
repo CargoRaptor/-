@@ -7,11 +7,11 @@ import { SYNONYMS } from './data/search_maps';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
-// Расширенный список стоп-слов, которые не могут быть "субъектом" поиска
+// Стоп-слова, которые никогда не будут считаться "главным предметом" поиска
 const STOP_WORDS = new Set([
   'для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой', 'такой', 
   'сверху', 'снизу', 'внутри', 'комплект', 'набор', 'шт', 'кг', 'с', 'и', 'в', 'на',
-  'бывший', 'новые', 'прочие', 'прочая', 'включая', 'кроме'
+  'бывший', 'новые', 'прочие', 'прочая', 'включая', 'кроме', 'использования', 'предназначенный'
 ]);
 
 const App: React.FC = () => {
@@ -30,13 +30,15 @@ const App: React.FC = () => {
   });
 
   // Индексация синонимов для мгновенного поиска по корням
-  const termToPrefixData = useMemo(() => {
-    const map: Record<string, {prefix: string, isSpecific: boolean}[]> = {};
+  // Мы создаем карту "корень слова -> массив префиксов кодов"
+  const stemToPrefixes = useMemo(() => {
+    const map: Record<string, string[]> = {};
     Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
       terms.forEach(term => {
         const stem = getStem(term);
+        if (stem.length < 3) return;
         if (!map[stem]) map[stem] = [];
-        map[stem].push({ prefix, isSpecific: prefix.length >= 4 });
+        map[stem].push(prefix);
       });
     });
     return map;
@@ -81,12 +83,13 @@ const App: React.FC = () => {
     date: new Date().toLocaleDateString('ru-RU')
   };
 
-  // Улучшенный стеммер для очистки окончаний прилагательных и существительных
+  // Универсальный стеммер для русского языка
   function getStem(word: string): string {
     return word
       .toLowerCase()
       .trim()
       .replace(/[.,!?;:]/g, '')
+      // Убираем падежные окончания, множественное число и суффиксы прилагательных
       .replace(/(иями|ями|иям|ям|иях|ях|овая|овое|овый|очные|очный|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
   }
 
@@ -94,86 +97,88 @@ const App: React.FC = () => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    // 1. Разбиваем на значимые слова
+    // 1. Разбиваем на токены, убирая "шум"
     const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
     if (queryWords.length === 0) return [];
     
     const queryStems = queryWords.map(w => getStem(w));
-    const subjectStem = queryStems[0]; // Первое слово - основной субъект поиска
+    const primarySubjectStem = queryStems[0]; // Первое слово - это "якорь" смысла
 
-    // 2. Находим смысловые разделы ТН ВЭД через словарь синонимов
-    const synonymMatches = new Map<string, {isSpecific: boolean, weight: number}>();
+    // 2. Находим потенциальные коды через индексированные синонимы
+    const codePrefixWeights = new Map<string, number>();
     queryStems.forEach((stem, idx) => {
-      Object.keys(termToPrefixData).forEach(termStem => {
-        // Проверяем прямое совпадение корня
-        if (termStem === stem || (termStem.length > 4 && termStem.startsWith(stem))) {
-          termToPrefixData[termStem].forEach(data => {
-            const current = synonymMatches.get(data.prefix);
-            // Если совпало первое слово запроса, вес в 3 раза выше
-            const weight = (idx === 0 ? 1000 : 300) * (termStem === stem ? 1 : 0.7);
-            if (!current || weight > current.weight) {
-              synonymMatches.set(data.prefix, { isSpecific: data.isSpecific, weight });
-            }
+      const multiplier = (idx === 0) ? 1.5 : 1.0; // Первое слово в поиске важнее
+      
+      // Ищем точное совпадение корня в карте синонимов
+      Object.keys(stemToPrefixes).forEach(mapStem => {
+        if (mapStem === stem || (mapStem.length > 4 && mapStem.startsWith(stem))) {
+          stemToPrefixes[mapStem].forEach(prefix => {
+            const current = codePrefixWeights.get(prefix) || 0;
+            codePrefixWeights.set(prefix, current + (1000 * multiplier));
           });
         }
       });
     });
 
-    // 3. Скоринг товаров
+    // 3. Скоринг всей базы по сложной формуле
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
-      let titleMatches = 0;
-      let hasSubjectInTitleOrSyn = false;
+      let subjectConfirmed = false;
+      let matchedStemsCount = 0;
 
       const title = item.name.toLowerCase();
-      const titleStems = title.split(/\s+/).map(w => getStem(w));
-      const categoryStems = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const titleTokens = title.split(/\s+/).map(w => getStem(w));
+      const categoryTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
       const description = item.description.toLowerCase();
 
-      // А) Проверка синонимов (Смысловой раздел)
-      synonymMatches.forEach((data, prefix) => {
+      // А) Проверка по синонимам (Maps)
+      codePrefixWeights.forEach((weight, prefix) => {
         if (item.code.startsWith(prefix)) {
-          score += data.weight;
-          if (data.weight >= 1000) hasSubjectInTitleOrSyn = true;
-          if (data.isSpecific) score += 500;
+          score += weight;
+          // Если по коду в мапе нашелся субъект поиска - это сильный сигнал
+          if (weight >= 1500) subjectConfirmed = true; 
         }
       });
 
-      // Б) Проверка слов в названии (Приоритет №1)
+      // Б) Проверка по заголовку и описанию
       queryStems.forEach((stem, idx) => {
-        if (titleStems.includes(stem)) {
-          const matchWeight = idx === 0 ? 2000 : 800;
-          score += matchWeight;
-          titleMatches++;
-          if (idx === 0) hasSubjectInTitleOrSyn = true;
+        const isPrimary = (idx === 0);
+        let foundWord = false;
+
+        if (titleTokens.includes(stem)) {
+          score += isPrimary ? 2000 : 800;
+          foundWord = true;
+          if (isPrimary) subjectConfirmed = true;
         } else if (title.includes(stem)) {
-          score += 400;
-          titleMatches++;
+          score += isPrimary ? 1000 : 400;
+          foundWord = true;
+          if (isPrimary) subjectConfirmed = true;
         }
 
-        // В категориях (Приоритет №2)
-        if (categoryStems.includes(stem)) {
-          score += 200;
+        if (categoryTokens.includes(stem)) {
+          score += isPrimary ? 300 : 100;
+          foundWord = true;
         }
 
-        // В описании (НИЗКИЙ ПРИОРИТЕТ - защита от галлюцинаций)
         if (description.includes(stem)) {
-          score += 50; 
+          score += 50; // Минимальный вес для описания, чтобы избежать ложных срабатываний
+          foundWord = true;
         }
+
+        if (foundWord) matchedStemsCount++;
       });
 
       // КРИТИЧЕСКИЙ ФИЛЬТР:
-      // 1. Если это единственный товар (1 слово в поиске), он ДОЛЖЕН быть в названии или синонимах
-      // 2. Если слов много, "субъект" (первое слово) должен быть подтвержден.
-      // 3. Если "говядина" не имеет слова "бутылка" в названии/синониме, она не пройдет.
-      const matchDensity = titleMatches / queryStems.length;
-      const isRelevant = hasSubjectInTitleOrSyn && (queryStems.length === 1 ? score > 500 : matchDensity >= 0.4);
+      // 1. Предмет (первое слово) ОБЯЗАТЕЛЬНО должен быть либо в названии, либо в проверенных синонимах кода.
+      // 2. Если в запросе много слов, мы требуем "кучности" (хотя бы 40% слов должны быть найдены).
+      const matchDensity = matchedStemsCount / queryStems.length;
+      const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 500 : matchDensity >= 0.4);
 
-      return { item, score, relevance: isRelevant };
+      return { item, score, isRelevant };
     });
 
     return scoredResults
-      .filter(res => res.relevance)
+      .filter(res => res.isRelevant)
       .sort((a, b) => b.score - a.score)
       .map(res => res.item)
       .slice(0, 24);
@@ -193,7 +198,7 @@ const App: React.FC = () => {
       if (results.length > 0) {
         document.getElementById('search-results-anchor')?.scrollIntoView({ behavior: 'smooth' });
       }
-    }, 200);
+    }, 250);
   };
 
   const handleSearchClick = (e: React.FormEvent) => {
