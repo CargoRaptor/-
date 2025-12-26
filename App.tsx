@@ -7,7 +7,6 @@ import { SYNONYMS } from './data/search_maps';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
-// Стоп-слова, которые никогда не будут считаться "главным предметом" поиска
 const STOP_WORDS = new Set([
   'для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой', 'такой', 
   'сверху', 'снизу', 'внутри', 'комплект', 'набор', 'шт', 'кг', 'с', 'и', 'в', 'на',
@@ -29,16 +28,24 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
-  // Индексация синонимов для мгновенного поиска по корням
-  // Мы создаем карту "корень слова -> массив префиксов кодов"
+  // Улучшенный стеммер: очищаем слово для поиска
+  function getStem(word: string): string {
+    return word
+      .toLowerCase()
+      .trim()
+      .replace(/[.,!?;:]/g, '')
+      .replace(/(иями|ями|иям|ям|иях|ях|овая|овое|овый|очные|очный|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
+  }
+
+  // Индексация синонимов (Search Maps)
   const stemToPrefixes = useMemo(() => {
     const map: Record<string, string[]> = {};
     Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
       terms.forEach(term => {
-        const stem = getStem(term);
-        if (stem.length < 3) return;
-        if (!map[stem]) map[stem] = [];
-        map[stem].push(prefix);
+        const s = term.toLowerCase().trim();
+        if (s.length < 2) return;
+        if (!map[s]) map[s] = [];
+        map[s].push(prefix);
       });
     });
     return map;
@@ -83,95 +90,72 @@ const App: React.FC = () => {
     date: new Date().toLocaleDateString('ru-RU')
   };
 
-  // Универсальный стеммер для русского языка
-  function getStem(word: string): string {
-    return word
-      .toLowerCase()
-      .trim()
-      .replace(/[.,!?;:]/g, '')
-      // Убираем падежные окончания, множественное число и суффиксы прилагательных
-      .replace(/(иями|ями|иям|ям|иях|ях|овая|овое|овый|очные|очный|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
-  }
-
   const handleSearchLocal = (query: string) => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    // 1. Разбиваем на токены, убирая "шум"
     const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
     if (queryWords.length === 0) return [];
     
     const queryStems = queryWords.map(w => getStem(w));
-    const primarySubjectStem = queryStems[0]; // Первое слово - это "якорь" смысла
 
-    // 2. Находим потенциальные коды через индексированные синонимы
+    // 1. Поиск кодов в SYNONYMS (Карта поиска)
     const codePrefixWeights = new Map<string, number>();
-    queryStems.forEach((stem, idx) => {
-      const multiplier = (idx === 0) ? 1.5 : 1.0; // Первое слово в поиске важнее
+    queryStems.forEach((qStem, qIdx) => {
+      const importance = qIdx === 0 ? 2.0 : 1.0;
       
-      // Ищем точное совпадение корня в карте синонимов
       Object.keys(stemToPrefixes).forEach(mapStem => {
-        if (mapStem === stem || (mapStem.length > 4 && mapStem.startsWith(stem))) {
+        // Двустороннее сравнение: корень из карты есть в запросе ИЛИ запрос начинается с корня из карты
+        if (qStem.includes(mapStem) || mapStem.includes(qStem)) {
           stemToPrefixes[mapStem].forEach(prefix => {
             const current = codePrefixWeights.get(prefix) || 0;
-            codePrefixWeights.set(prefix, current + (1000 * multiplier));
+            const matchQuality = mapStem === qStem ? 1 : 0.8;
+            codePrefixWeights.set(prefix, current + (1000 * importance * matchQuality));
           });
         }
       });
     });
 
-    // 3. Скоринг всей базы по сложной формуле
+    // 2. Скоринг товаров из TNVED_DB
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
       let subjectConfirmed = false;
       let matchedStemsCount = 0;
 
       const title = item.name.toLowerCase();
-      const titleTokens = title.split(/\s+/).map(w => getStem(w));
-      const categoryTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const titleStems = title.split(/\s+/).map(w => getStem(w));
       const description = item.description.toLowerCase();
 
-      // А) Проверка по синонимам (Maps)
+      // А) Вес из карты синонимов (Самый надежный способ подтверждения)
       codePrefixWeights.forEach((weight, prefix) => {
         if (item.code.startsWith(prefix)) {
           score += weight;
-          // Если по коду в мапе нашелся субъект поиска - это сильный сигнал
-          if (weight >= 1500) subjectConfirmed = true; 
+          subjectConfirmed = true; // Если код совпал с синонимами из карты - товар точно "тот самый"
         }
       });
 
-      // Б) Проверка по заголовку и описанию
-      queryStems.forEach((stem, idx) => {
-        const isPrimary = (idx === 0);
-        let foundWord = false;
+      // Б) Вес из заголовка
+      queryStems.forEach((qStem, qIdx) => {
+        let wordFound = false;
+        const isPrimary = qIdx === 0;
 
-        if (titleTokens.includes(stem)) {
-          score += isPrimary ? 2000 : 800;
-          foundWord = true;
-          if (isPrimary) subjectConfirmed = true;
-        } else if (title.includes(stem)) {
-          score += isPrimary ? 1000 : 400;
-          foundWord = true;
-          if (isPrimary) subjectConfirmed = true;
+        if (titleStems.some(ts => ts.includes(qStem) || qStem.includes(ts))) {
+          score += isPrimary ? 3000 : 1200;
+          wordFound = true;
+          subjectConfirmed = true;
         }
 
-        if (categoryTokens.includes(stem)) {
-          score += isPrimary ? 300 : 100;
-          foundWord = true;
+        if (description.includes(qStem)) {
+          score += 100; // Описанию даем мало веса
+          wordFound = true;
         }
 
-        if (description.includes(stem)) {
-          score += 50; // Минимальный вес для описания, чтобы избежать ложных срабатываний
-          foundWord = true;
-        }
-
-        if (foundWord) matchedStemsCount++;
+        if (wordFound) matchedStemsCount++;
       });
 
-      // КРИТИЧЕСКИЙ ФИЛЬТР:
-      // 1. Предмет (первое слово) ОБЯЗАТЕЛЬНО должен быть либо в названии, либо в проверенных синонимах кода.
-      // 2. Если в запросе много слов, мы требуем "кучности" (хотя бы 40% слов должны быть найдены).
+      // Фильтрация
       const matchDensity = matchedStemsCount / queryStems.length;
+      // Релевантно, если предмет подтвержден И (одно слово совпало на 100% ИЛИ длинный запрос совпал на 40%)
       const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 500 : matchDensity >= 0.4);
 
       return { item, score, isRelevant };
@@ -181,7 +165,7 @@ const App: React.FC = () => {
       .filter(res => res.isRelevant)
       .sort((a, b) => b.score - a.score)
       .map(res => res.item)
-      .slice(0, 24);
+      .slice(0, 30);
   };
 
   const triggerSearch = (query: string) => {
@@ -198,7 +182,7 @@ const App: React.FC = () => {
       if (results.length > 0) {
         document.getElementById('search-results-anchor')?.scrollIntoView({ behavior: 'smooth' });
       }
-    }, 250);
+    }, 300);
   };
 
   const handleSearchClick = (e: React.FormEvent) => {
