@@ -37,88 +37,97 @@ const App: React.FC = () => {
       // Убираем окончания и суффиксы для получения чистого корня
       .replace(/(иями|ями|иям|ям|иях|ях|овая|овое|овый|очные|очный|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
   }
+// Токенизация (рус/лат/цифры)
+const tokenize = (text: string): string[] =>
+  text
+    .toLowerCase()
+    .replace(/[^a-zа-я0-9]+/gi, ' ')
+    .split(' ')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  // Индексация карты синонимов
-  const { stemToPrefixes, stemPrefixIndex } = useMemo(() => {
-    const stemToPrefixes = new Map<string, string[]>();
-    const stemPrefixIndex = new Map<string, string[]>();
-
-    Object.entries(SYNONYMS).forEach(([codePrefix, terms]) => {
-      terms.forEach((term) => {
-        const stem = getStem(term.toLowerCase().trim());
-        if (stem.length < 2) return;
-
-        const arr = stemToPrefixes.get(stem);
-        if (arr) arr.push(codePrefix);
-        else stemToPrefixes.set(stem, [codePrefix]);
-      });
-    });
-
-    // Tiny bucket index: first 3 chars of stem -> list of stems
-    for (const stem of stemToPrefixes.keys()) {
-      const key = stem.slice(0, 3);
-      if (key.length < 2) continue;
-
-      const bucket = stemPrefixIndex.get(key);
-      if (bucket) bucket.push(stem);
-      else stemPrefixIndex.set(key, [stem]);
-    }
-
-    return { stemToPrefixes, stemPrefixIndex };
-  }, []);
-
-  type IndexedTNVED = TNVEDCode & {
-    _titleLower: string;
-    _descLower: string;
-    _titleStems: string[];
-    _code2: string;
-    _code4: string;
+// Прединдексация базы ТН ВЭД (делается 1 раз)
+const tnvedIndex = useMemo(() => {
+  type Rec = {
+    item: TNVEDCode;
+    titleLower: string;
+    descLower: string;
+    titleStems: string[];
   };
 
-  const searchIndex = useMemo(() => {
-    const items: IndexedTNVED[] = TNVED_DB.map((item) => {
-      const _titleLower = item.name.toLowerCase();
-      const _descLower = (item.description || '').toLowerCase();
-      const _titleStems = _titleLower
-        .split(/\s+/)
-        .map((w) => getStem(w))
-        .filter((s) => s.length >= 2);
+  const records: Rec[] = [];
+  const stemIndex = new Map<string, number[]>(); // stem -> idx[]
+  const prefix2 = new Map<string, number[]>();
+  const prefix4 = new Map<string, number[]>();
+  const prefix6 = new Map<string, number[]>();
 
-      return {
-        ...item,
-        _titleLower,
-        _descLower,
-        _titleStems,
-        _code2: item.code.slice(0, 2),
-        _code4: item.code.slice(0, 4),
-      };
+  const push = (m: Map<string, number[]>, k: string, idx: number) => {
+    const arr = m.get(k);
+    if (arr) arr.push(idx);
+    else m.set(k, [idx]);
+  };
+
+  TNVED_DB.forEach((item, idx) => {
+    const titleLower = item.name.toLowerCase();
+    const descLower = item.description.toLowerCase();
+
+    const titleStems = tokenize(titleLower)
+      .filter(w => w.length >= 2 && !STOP_WORDS.has(w))
+      .map(getStem)
+      .filter(s => s.length >= 4);
+
+    records.push({ item, titleLower, descLower, titleStems });
+
+    // stem index (по названию)
+    // (чтобы “кружка” не приводила к “кружево”, используем стем >= 4 и точное совпадение)
+    const uniq = new Set(titleStems);
+    uniq.forEach(st => push(stemIndex, st, idx));
+
+    // prefix indexes
+    const c = item.code;
+    if (c.length >= 2) push(prefix2, c.slice(0, 2), idx);
+    if (c.length >= 4) push(prefix4, c.slice(0, 4), idx);
+    if (c.length >= 6) push(prefix6, c.slice(0, 6), idx);
+  });
+
+  return { records, stemIndex, prefix2, prefix4, prefix6 };
+}, []);
+
+// Индексация карты SYNONYMS: теперь сопоставляем “стем -> префиксы”, а не перебираем все ключи каждый раз
+const synonymIndex = useMemo(() => {
+  const stemToPrefixes = new Map<string, Set<string>>();
+  const bucket3 = new Map<string, string[]>(); // первые 3 буквы стема -> список стемов (для аккуратного fuzzy)
+
+  const addStem = (stem: string, prefix: string) => {
+    if (stem.length < 4) return; // критично: режем шум
+    if (STOP_WORDS.has(stem)) return;
+
+    const set = stemToPrefixes.get(stem);
+    if (set) set.add(prefix);
+    else stemToPrefixes.set(stem, new Set([prefix]));
+  };
+
+  Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
+    terms.forEach(term => {
+      const tokens = tokenize(term);
+      tokens.forEach(tok => {
+        if (tok.length < 2 || STOP_WORDS.has(tok)) return;
+        const st = getStem(tok);
+        addStem(st, prefix);
+      });
     });
+  });
 
-    const byPrefix2 = new Map<string, number[]>();
-    const byPrefix4 = new Map<string, number[]>();
-    const byStem = new Map<string, number[]>();
+  // bucket3 для “мягкого” поиска стемов только внутри своей корзины
+  Array.from(stemToPrefixes.keys()).forEach(st => {
+    const k = st.slice(0, 3);
+    const arr = bucket3.get(k);
+    if (arr) arr.push(st);
+    else bucket3.set(k, [st]);
+  });
 
-    const pushIndex = (map: Map<string, number[]>, key: string, idx: number) => {
-      const arr = map.get(key);
-      if (arr) arr.push(idx);
-      else map.set(key, [idx]);
-    };
-
-    items.forEach((it, idx) => {
-      pushIndex(byPrefix2, it._code2, idx);
-      pushIndex(byPrefix4, it._code4, idx);
-
-      // Inverted index by title stems (unique per item to reduce noise)
-      const uniq = new Set(it._titleStems);
-      for (const s of uniq) {
-        if (s.length < 3) continue;
-        pushIndex(byStem, s, idx);
-      }
-    });
-
-    return { items, byPrefix2, byPrefix4, byStem };
-  }, []);
-
+  return { stemToPrefixes, bucket3 };
+}, []);
 
   useEffect(() => {
     const handleScroll = () => {
@@ -159,145 +168,149 @@ const App: React.FC = () => {
     date: new Date().toLocaleDateString('ru-RU')
   };
 
-  const handleSearchLocal = (query: string) => {
-    const trimmed = query.trim().toLowerCase();
-    if (trimmed.length < 2) return [];
+  
+const handleSearchLocal = (query: string) => {
+  const trimmed = query.trim().toLowerCase();
+  if (trimmed.length < 2) return [];
 
-    const queryWords = trimmed
-      .split(/\s+/)
-      .map((w) => w.trim())
-      .filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
+  // 0) Если пользователь ввёл цифры — ищем по коду напрямую
+  const onlyDigits = trimmed.replace(/\D+/g, '');
+  const looksLikeCode = onlyDigits.length >= 2 && onlyDigits.length <= 10 && onlyDigits.length >= trimmed.length - 1;
+  if (looksLikeCode) {
+    return tnvedIndex.records
+      .filter(r => r.item.code.startsWith(onlyDigits))
+      .slice(0, 30)
+      .map(r => r.item);
+  }
 
-    if (queryWords.length === 0) return [];
+  const queryWords = tokenize(trimmed).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
+  if (queryWords.length === 0) return [];
 
-    const queryStems = queryWords.map((w) => getStem(w)).filter((s) => s.length >= 2);
-    if (queryStems.length === 0) return [];
+  // Стемы запроса (важно: только >= 4, иначе начинается “кружка -> кружево” и т.п.)
+  const queryStemsRaw = queryWords.map(w => getStem(w)).filter(s => s.length >= 4);
+  const queryStems = Array.from(new Set(queryStemsRaw));
+  if (queryStems.length === 0) return [];
 
-    // 1) Collect candidate code prefixes (fast: direct stem hit first; then small-bucket fuzzy)
-    const codePrefixWeights = new Map<string, number>();
-    const addPrefixWeight = (prefix: string, weight: number) => {
-      codePrefixWeights.set(prefix, (codePrefixWeights.get(prefix) || 0) + weight);
-    };
+  const minMatches = queryStems.length <= 1 ? 1 : Math.min(2, queryStems.length);
 
-    queryStems.forEach((qStem, qIdx) => {
-      const importance = qIdx === 0 ? 2.5 : 1.0;
+  // 1) Получаем “кандидатные” префиксы из SYNONYMS (точное совпадение стема; fuzzy — только в своей bucket3)
+  const prefixScore = new Map<string, number>();
+  const addPrefix = (prefix: string, add: number) => {
+    prefixScore.set(prefix, (prefixScore.get(prefix) || 0) + add);
+  };
 
-      const direct = stemToPrefixes.get(qStem);
-      if (direct && direct.length) {
-        for (const prefix of direct) addPrefixWeight(prefix, 2000 * importance * 1.2);
-        return;
-      }
+  queryStems.forEach((st, idx) => {
+    const importance = idx === 0 ? 3 : 1;
 
-      const bucketKey = qStem.slice(0, 3);
-      const bucket = stemPrefixIndex.get(bucketKey) || [];
-      for (const mapStem of bucket) {
-        if (qStem.includes(mapStem) || mapStem.includes(qStem)) {
-          const prefixes = stemToPrefixes.get(mapStem);
-          if (!prefixes) continue;
-
-          const matchQuality = mapStem === qStem ? 1.2 : 0.8;
-          for (const prefix of prefixes) addPrefixWeight(prefix, 2000 * importance * matchQuality);
-        }
-      }
-    });
-
-    // 2) Build candidate list (avoid scanning the whole DB when we have a prefix signal)
-    const candidates = new Set<number>();
-
-    const addCandidatesFromPrefix = (prefix: string) => {
-      if (prefix.length === 2) {
-        const arr = searchIndex.byPrefix2.get(prefix);
-        if (arr) arr.forEach((i) => candidates.add(i));
-        return;
-      }
-      if (prefix.length === 4) {
-        const arr = searchIndex.byPrefix4.get(prefix);
-        if (arr) arr.forEach((i) => candidates.add(i));
-        return;
-      }
-      // Fallback for unexpected prefix length
-      const p4 = prefix.slice(0, 4);
-      if (p4.length === 4) {
-        const arr = searchIndex.byPrefix4.get(p4);
-        if (arr) arr.forEach((i) => candidates.add(i));
-      }
-    };
-
-    if (codePrefixWeights.size > 0) {
-      for (const prefix of codePrefixWeights.keys()) addCandidatesFromPrefix(prefix);
-    } else {
-      // Fallback to inverted index by stems
-      for (const s of queryStems) {
-        const arr = searchIndex.byStem.get(s);
-        if (arr) arr.forEach((i) => candidates.add(i));
-      }
-
-      // If still empty, do a limited scan fallback
-      if (candidates.size === 0) {
-        for (let i = 0; i < searchIndex.items.length && i < 3000; i++) candidates.add(i);
-      }
+    const exact = synonymIndex.stemToPrefixes.get(st);
+    if (exact) {
+      exact.forEach(p => addPrefix(p, 10 * importance));
+      return;
     }
 
-    // 3) Score only candidates
-    const results: { item: TNVEDCode; score: number; isRelevant: boolean }[] = [];
-    const prefixesArray = Array.from(codePrefixWeights.entries());
+    // Fuzzy: смотрим только “родную” корзину по первым 3 буквам
+    const b = synonymIndex.bucket3.get(st.slice(0, 3)) || [];
+    for (const cand of b) {
+      // Очень аккуратно: “лосины” не должны матчиться с “лосось”
+      const ok =
+        (cand.startsWith(st) || st.startsWith(cand)) &&
+        Math.abs(cand.length - st.length) <= 2;
 
-    for (const idx of candidates) {
-      const item = searchIndex.items[idx];
-      let score = 0;
-      let subjectConfirmed = false;
-      let matchedStemsCount = 0;
-
-      // A) Prefix signal (fast)
-      if (prefixesArray.length) {
-        for (const [prefix, weight] of prefixesArray) {
-          if (prefix.length === 2 && item._code2 === prefix) {
-            score += weight;
-            subjectConfirmed = true;
-          } else if (prefix.length === 4 && item._code4 === prefix) {
-            score += weight;
-            subjectConfirmed = true;
-          } else if (prefix.length !== 2 && prefix.length !== 4 && item.code.startsWith(prefix)) {
-            score += weight;
-            subjectConfirmed = true;
-          }
-        }
+      if (ok) {
+        const ps = synonymIndex.stemToPrefixes.get(cand);
+        ps?.forEach(p => addPrefix(p, 5 * importance));
       }
+    }
+  });
 
-      // B) Text match
-      for (let qIdx = 0; qIdx < queryStems.length; qIdx++) {
-        const qStem = queryStems[qIdx];
+  const topPrefixes = Array.from(prefixScore.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([p]) => p);
+
+  // 2) Генерируем кандидатов (без перебора всей базы)
+  const candidateIdx = new Set<number>();
+
+  const addMany = (arr?: number[]) => {
+    if (!arr) return;
+    for (const x of arr) candidateIdx.add(x);
+  };
+
+  // 2.1) из текста (инвертированный индекс по стемам названия)
+  queryStems.forEach(st => addMany(tnvedIndex.stemIndex.get(st)));
+
+  // 2.2) из SYNONYMS префиксов
+  topPrefixes.forEach(p => {
+    if (p.length >= 6) addMany(tnvedIndex.prefix6.get(p.slice(0, 6)));
+    else if (p.length >= 4) addMany(tnvedIndex.prefix4.get(p.slice(0, 4)));
+    else addMany(tnvedIndex.prefix2.get(p.slice(0, 2)));
+  });
+
+  // Фолбэк: если совсем пусто — ищем по подстроке в названии/описании, но ограниченно (не 13k каждый раз)
+  let candidates: number[] = Array.from(candidateIdx);
+  if (candidates.length === 0) {
+    const pool: number[] = [];
+    for (let i = 0; i < tnvedIndex.records.length; i += 1) {
+      const r = tnvedIndex.records[i];
+      // быстрая грубая проверка по первому слову
+      if (r.titleLower.includes(queryWords[0]) || r.descLower.includes(queryWords[0])) pool.push(i);
+      if (pool.length >= 2500) break;
+    }
+    candidates = pool;
+  }
+
+  // 3) Ско́ринг (текст — главный; префикс — только как подсказка, а не “истина”)
+  const scored = candidates
+    .map(idx => {
+      const r = tnvedIndex.records[idx];
+
+      let score = 0;
+      let matched = 0;
+
+      // Фраза целиком в названии — жирный плюс
+      if (r.titleLower.includes(trimmed)) score += 5000;
+
+      queryStems.forEach((st, qIdx) => {
         const isPrimary = qIdx === 0;
 
-        let wordFound = false;
-
-        if (item._titleStems.some((ts) => ts.includes(qStem) || qStem.includes(ts))) {
-          score += isPrimary ? 4000 : 1500;
-          wordFound = true;
-          subjectConfirmed = true;
+        // попадание в название по стемам
+        const inTitle = r.titleStems.some(ts => ts === st || ts.startsWith(st) || st.startsWith(ts));
+        if (inTitle) {
+          score += isPrimary ? 2200 : 1400;
+          matched += 1;
+          return;
         }
 
-        if (!wordFound && item._descLower.includes(qStem)) {
-          score += 100;
-          wordFound = true;
+        // попадание в описание (гораздо слабее)
+        if (r.descLower.includes(st)) {
+          score += isPrimary ? 700 : 350;
+          matched += 1;
         }
+      });
 
-        if (wordFound) matchedStemsCount++;
-      }
+      // Подсказка от SYNONYMS (маленький бонус)
+      let prefixHitScore = 0;
+      topPrefixes.forEach(p => {
+        if (r.item.code.startsWith(p)) prefixHitScore = Math.max(prefixHitScore, prefixScore.get(p) || 0);
+      });
 
-      const matchDensity = matchedStemsCount / queryStems.length;
-      const isRelevant = subjectConfirmed && (queryStems.length === 1 ? score > 800 : matchDensity >= 0.4);
+      if (prefixHitScore > 0) score += Math.min(900, prefixHitScore * 30);
 
-      if (isRelevant) results.push({ item, score, isRelevant });
-    }
+      // Если есть только префикс, но нет текста — резко вниз (устраняет “лосины -> рыба”)
+      if (matched === 0 && prefixHitScore > 0) score -= 3000;
 
-    return results
-      .sort((a, b) => b.score - a.score)
-      .map((r) => r.item)
-      .slice(0, 30);
-  };;
+      const isRelevant = matched >= minMatches || (matched >= 1 && queryStems.length === 1);
+      return { item: r.item, score, isRelevant };
+    })
+    .filter(x => x.isRelevant)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 30)
+    .map(x => x.item);
 
-  const triggerSearch = (query: string) => {
+  return scored;
+};
+
+const triggerSearch = (query: string) => {
     setIsSearching(true);
     setSearchResults([]);
     setHasSearched(false);
