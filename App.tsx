@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { TNVEDCode, ExchangeRates } from './types';
 import { Calculator } from './components/Calculator';
 import { TNVED_DB } from './data/tnved_db';
@@ -7,8 +7,11 @@ import { CATEGORY_MAP, SYNONYMS } from './data/search_maps';
 
 const POPULAR_LIBRARY: TNVEDCode[] = TNVED_DB.slice(0, 4);
 
-// Список "стоп-слов", которые не должны влиять на поиск как основной критерий
-const STOP_WORDS = new Set(['для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой']);
+// Расширенный список стоп-слов для фильтрации мусора в запросах
+const STOP_WORDS = new Set([
+  'для', 'из', 'под', 'над', 'без', 'при', 'все', 'эти', 'этот', 'какой', 'такой', 
+  'сверху', 'снизу', 'внутри', 'комплект', 'набор', 'шт', 'кг', 'с', 'и', 'в', 'на'
+]);
 
 const App: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -25,21 +28,17 @@ const App: React.FC = () => {
     EUR: '98.5'
   });
 
-  const [termToPrefixData, setTermToPrefixData] = useState<Record<string, {prefix: string, isSpecific: boolean}[]>>({});
-
-  useEffect(() => {
+  // Пре-индексация синонимов для ускорения поиска
+  const termToPrefixData = useMemo(() => {
     const map: Record<string, {prefix: string, isSpecific: boolean}[]> = {};
     Object.entries(SYNONYMS).forEach(([prefix, terms]) => {
       terms.forEach(term => {
         const stem = getStem(term);
         if (!map[stem]) map[stem] = [];
-        map[stem].push({
-          prefix,
-          isSpecific: prefix.length >= 4
-        });
+        map[stem].push({ prefix, isSpecific: prefix.length >= 4 });
       });
     });
-    setTermToPrefixData(map);
+    return map;
   }, []);
 
   useEffect(() => {
@@ -81,97 +80,97 @@ const App: React.FC = () => {
     date: new Date().toLocaleDateString('ru-RU')
   };
 
-  const getStem = (word: string): string => {
+  // Универсальный стеммер для русского языка
+  function getStem(word: string): string {
     return word
       .toLowerCase()
       .trim()
       .replace(/[.,!?;:]/g, '')
-      // Более строгая очистка окончаний для русского языка
+      // Убираем падежные окончания, множественное число и суффиксы прилагательных
       .replace(/(иями|ями|иям|ям|иях|ях|ов|ев|ий|ый|ая|ое|ые|ие|ия|ой|ей|ам|ом|а|и|ы|е|у|ю|ь|я|с)$/g, '');
-  };
+  }
 
   const handleSearchLocal = (query: string) => {
     const trimmed = query.trim().toLowerCase();
     if (trimmed.length < 2) return [];
 
-    // Фильтруем стоп-слова и короткие мусорные части
+    // 1. Разбиваем на токены, убирая "шум"
     const queryWords = trimmed.split(/\s+/).filter(w => w.length >= 2 && !STOP_WORDS.has(w));
     if (queryWords.length === 0) return [];
-
     const queryStems = queryWords.map(w => getStem(w));
     
-    // 1. Предварительный поиск префиксов через словарь синонимов
-    const matchedPrefixData = new Map<string, {isSpecific: boolean, weight: number, matchedStem: string}>();
+    // 2. Находим потенциальные коды через синонимы
+    const synonymMatches = new Map<string, {isSpecific: boolean, weight: number}>();
     queryStems.forEach(stem => {
       Object.keys(termToPrefixData).forEach(termStem => {
-        // Требуем либо точного совпадения корней, либо вложенности для длинных слов
-        const isMatch = termStem === stem || (stem.length > 4 && termStem.startsWith(stem)) || (termStem.length > 4 && stem.startsWith(termStem));
-        if (isMatch) {
+        if (termStem === stem || (termStem.length > 3 && (termStem.startsWith(stem) || stem.startsWith(termStem)))) {
           termToPrefixData[termStem].forEach(data => {
-            const current = matchedPrefixData.get(data.prefix);
-            const matchWeight = termStem === stem ? 100 : 50;
-            if (!current || matchWeight > current.weight) {
-              matchedPrefixData.set(data.prefix, { 
-                isSpecific: data.isSpecific, 
-                weight: matchWeight,
-                matchedStem: stem 
-              });
+            const current = synonymMatches.get(data.prefix);
+            const weight = termStem === stem ? 500 : 200;
+            if (!current || weight > current.weight) {
+              synonymMatches.set(data.prefix, { isSpecific: data.isSpecific, weight });
             }
           });
         }
       });
     });
 
+    // 3. Ранжируем всю базу данных
     const scoredResults = TNVED_DB.map(item => {
       let score = 0;
-      let matchedInNameCount = 0;
-      let matchedInSynonymsCount = 0;
+      let matchedStems = new Set<string>();
+      let titleMatchCount = 0;
 
-      const nameTokens = item.name.toLowerCase().split(/\s+/).map(w => getStem(w));
-      const catTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
-      
-      // А) Проверка по найденным через синонимы префиксам
-      matchedPrefixData.forEach((data, prefix) => {
+      const title = item.name.toLowerCase();
+      const titleTokens = title.split(/\s+/).map(w => getStem(w));
+      const categoryTokens = item.category.toLowerCase().split(/\s+/).map(w => getStem(w));
+      const description = item.description.toLowerCase();
+
+      // А) Бонус за синонимы
+      synonymMatches.forEach((data, prefix) => {
         if (item.code.startsWith(prefix)) {
-          score += data.isSpecific ? 200 : 100;
-          matchedInSynonymsCount++;
+          score += data.weight;
+          // Если код специфичный (4+ цифры), это очень сильный сигнал
+          if (data.isSpecific) score += 300;
         }
       });
 
-      // Б) Прямое совпадение слов запроса в Названии и Категории
+      // Б) Бонус за вхождение в заголовок (самый важный фактор)
       queryStems.forEach(stem => {
-        // Точное совпадение корня в названии — самый высокий приоритет
-        if (nameTokens.includes(stem)) {
-          score += 300;
-          matchedInNameCount++;
-        } else if (nameTokens.some(nt => nt.startsWith(stem) || stem.startsWith(nt))) {
-          // Частичное совпадение корня
-          score += 150;
-          matchedInNameCount++;
+        // Точное совпадение корня в названии
+        if (titleTokens.includes(stem)) {
+          score += 1000;
+          titleMatchCount++;
+          matchedStems.add(stem);
+        } else if (title.includes(stem)) {
+          // Частичное вхождение (например "запчасть" в "автозапчасти")
+          score += 400;
+          titleMatchCount++;
+          matchedStems.add(stem);
         }
 
-        // Совпадение в категории — средний приоритет
-        if (catTokens.includes(stem)) {
-          score += 50;
+        // Вхождение в категорию (меньший приоритет)
+        if (categoryTokens.includes(stem)) {
+          score += 100;
+          matchedStems.add(stem);
+        }
+
+        // Вхождение в описание (минимальный приоритет, чтобы не было "галлюцинаций")
+        if (description.includes(stem)) {
+          score += 20;
+          matchedStems.add(stem);
         }
       });
 
-      // В) КРИТИЧЕСКИЙ ФИЛЬТР: Защита от "туш говяжьих" при поиске "бутылок"
-      // Если в названии товара нет НИ ОДНОГО совпадения корня из запроса, 
-      // и это не подтверждено синонимами, обнуляем результат.
-      const hasDirectMatch = matchedInNameCount > 0 || matchedInSynonymsCount > 0;
+      // КРИТИЧЕСКИЙ ФИЛЬТР: 
+      // 1. Если в запросе 2+ слова, но в заголовке/синонимах нет ни одного — товар нерелевантен.
+      // 2. Если это "туша говяжья", в ней нет корня "бутылк", поэтому она получит 0 баллов и не пройдет.
+      const hasAnySignificantMatch = titleMatchCount > 0 || (synonymMatches.size > 0 && Array.from(synonymMatches.keys()).some(p => item.code.startsWith(p)));
       
-      // Если запрос многословный (напр. "спортивная бутылка"), 
-      // требуем хотя бы 2 совпадения или 1 очень сильное в названии.
-      const isLowQualityMatch = queryStems.length >= 2 && matchedInNameCount < 1 && matchedInSynonymsCount < 1;
-
-      // Штраф за отсутствие "кучности" слов
-      if (queryStems.length > 1) {
-        score += (matchedInNameCount * 100); 
-      }
-
-      // Г) Оценка релевантности
-      const isRelevant = hasDirectMatch && !isLowQualityMatch && score > 80;
+      // Если запрос сложный, требуем чтобы хотя бы половина слов была найдена
+      // Fix: queryStems is a string array, so we must use .length instead of .size
+      const matchDensity = matchedStems.size / queryStems.length;
+      const isRelevant = hasAnySignificantMatch && (queryStems.length === 1 ? score > 50 : matchDensity >= 0.4);
 
       return { item, score, relevance: isRelevant };
     });
